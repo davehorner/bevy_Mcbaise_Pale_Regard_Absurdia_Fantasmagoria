@@ -15,7 +15,7 @@ This file keeps the scaffolding/protocol details that were previously in the REA
 ├─ src/                       # burn_human library
 ├─ crates/bevy_burn_human/    # bevy demo app (native + web)
 ├─ tool/                      # reference export scripts
-└─ tests/reference/           # exported safetensors + metadata
+└─ assets/model/           # exported safetensors + metadata
 ```
 
 ## quickstart (native demo)
@@ -43,7 +43,7 @@ cargo bench -p bevy_burn_human -- forward_all_cases
 ## reference export (python → safetensors)
 ```bash
 python tool/scripts/export_reference.py \
-  --output tests/reference/fullbody_default.safetensors \
+  --output assets/model/fullbody_default.safetensors \
   --seed 1234
 ```
 this writes `fullbody_default.safetensors` and `fullbody_default.meta.json` consumed by the rust crate. the vendored anny lives under `anny/` and is untouched.

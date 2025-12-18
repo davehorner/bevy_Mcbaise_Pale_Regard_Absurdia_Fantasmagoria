@@ -7,16 +7,15 @@ use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_panorbit_camera::{PanOrbitCamera, PanOrbitCameraPlugin};
-use fastrand;
 use noise::{NoiseFn, OpenSimplex};
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
 
 #[cfg(target_arch = "wasm32")]
-const TENSOR_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.safetensors");
+const TENSOR_BYTES: &[u8] = include_bytes!("../../assets/model/fullbody_default.safetensors");
 #[cfg(target_arch = "wasm32")]
-const META_BYTES: &[u8] = include_bytes!("../../tests/reference/fullbody_default.meta.json");
+const META_BYTES: &[u8] = include_bytes!("../../assets/model/fullbody_default.meta.json");
 
 #[derive(Component)]
 struct HumanTag;

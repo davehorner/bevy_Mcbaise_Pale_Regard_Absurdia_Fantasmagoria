@@ -3,8 +3,8 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 fn load_body() -> AnnyBody {
     AnnyBody::from_reference_paths(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
+        "assets/model/fullbody_default.safetensors",
+        "assets/model/fullbody_default.meta.json",
     )
     .expect("load reference")
 }

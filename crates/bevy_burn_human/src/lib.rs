@@ -25,8 +25,8 @@ pub enum BurnHumanSource {
 impl BurnHumanSource {
     pub fn default_paths() -> Self {
         Self::Paths {
-            tensor: PathBuf::from("tests/reference/fullbody_default.safetensors"),
-            meta: PathBuf::from("tests/reference/fullbody_default.meta.json"),
+            tensor: PathBuf::from("assets/model/fullbody_default.safetensors"),
+            meta: PathBuf::from("assets/model/fullbody_default.meta.json"),
         }
     }
 }
@@ -130,17 +130,31 @@ impl Default for BurnHumanMeshSettings {
 #[derive(Component, Default)]
 pub struct BurnHumanCacheKey(pub u64);
 
+type HydrateQueryItem<'w> = (
+    Entity,
+    Option<&'w BurnHumanMeshSettings>,
+    Option<&'w BurnHumanCacheKey>,
+    Option<&'w Mesh3d>,
+);
+
+type MeshUpdateItem<'w> = (
+    &'w BurnHumanInput,
+    &'w BurnHumanMeshSettings,
+    &'w mut Mesh3d,
+    &'w mut BurnHumanCacheKey,
+);
+
+type MeshUpdateFilter = Or<(
+    Changed<BurnHumanInput>,
+    Changed<BurnHumanMeshSettings>,
+    Added<Mesh3d>,
+    Added<BurnHumanInput>,
+    Added<BurnHumanMeshSettings>,
+)>;
+
 fn hydrate_burn_humans(
     mut commands: Commands,
-    query: Query<
-        (
-            Entity,
-            Option<&BurnHumanMeshSettings>,
-            Option<&BurnHumanCacheKey>,
-            Option<&Mesh3d>,
-        ),
-        With<BurnHumanInput>,
-    >,
+    query: Query<HydrateQueryItem<'_>, With<BurnHumanInput>>,
 ) {
     for (entity, settings, cache, mesh) in query.iter() {
         let mut e = commands.entity(entity);
@@ -160,21 +174,7 @@ fn update_burn_human_meshes(
     mut meshes: ResMut<Assets<Mesh>>,
     assets: Res<BurnHumanAssets>,
     mut cache: ResMut<BurnHumanMeshCache>,
-    mut query: Query<
-        (
-            &BurnHumanInput,
-            &BurnHumanMeshSettings,
-            &mut Mesh3d,
-            &mut BurnHumanCacheKey,
-        ),
-        Or<(
-            Changed<BurnHumanInput>,
-            Changed<BurnHumanMeshSettings>,
-            Added<Mesh3d>,
-            Added<BurnHumanInput>,
-            Added<BurnHumanMeshSettings>,
-        )>,
-    >,
+    mut query: Query<MeshUpdateItem<'_>, MeshUpdateFilter>,
 ) {
     for (input, settings, mut mesh_handle, mut cached) in query.iter_mut() {
         let key = cache_key(input, settings.compute_normals);

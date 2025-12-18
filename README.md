@@ -52,10 +52,10 @@ fn setup(
 ## generate reference data
 
 ```bash
-python tool/scripts/export_reference.py --output tests/reference/fullbody_default.safetensors --seed 1234
+python tool/scripts/export_reference.py --output assets/model/fullbody_default.safetensors --seed 1234
 ```
 
-exporter runs against the vendored `anny/` codebase and writes `tests/reference/fullbody_default.safetensors` plus `tests/reference/fullbody_default.meta.json` consumed by the library/tests/demo. The output is deterministic (seeded) and cached assets live under `.cache/anny/`.
+exporter runs against the vendored `anny/` codebase and writes `assets/model/fullbody_default.safetensors` plus `assets/model/fullbody_default.meta.json` consumed by the library/tests/demo. The output is deterministic (seeded) and cached assets live under `.cache/anny/`.
 
 
 ## run the demo

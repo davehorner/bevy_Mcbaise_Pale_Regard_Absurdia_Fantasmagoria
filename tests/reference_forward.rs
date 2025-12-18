@@ -4,8 +4,8 @@ use std::error::Error;
 
 fn load_model() -> Result<AnnyReference, Box<dyn Error>> {
     Ok(AnnyReference::from_paths(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
+        "assets/model/fullbody_default.safetensors",
+        "assets/model/fullbody_default.meta.json",
     )?)
 }
 
@@ -13,8 +13,8 @@ fn load_model() -> Result<AnnyReference, Box<dyn Error>> {
 fn reference_cases_roundtrip() -> Result<(), Box<dyn Error>> {
     let model = load_model()?;
     let bundle = load_reference_bundle(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
+        "assets/model/fullbody_default.safetensors",
+        "assets/model/fullbody_default.meta.json",
     )?;
 
     for name in model.case_names() {
@@ -101,12 +101,12 @@ fn reference_metadata_present() -> Result<(), Box<dyn Error>> {
 #[test]
 fn anny_body_forward_returns_reference_outputs() -> Result<(), Box<dyn Error>> {
     let body = AnnyBody::from_reference_paths(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
+        "assets/model/fullbody_default.safetensors",
+        "assets/model/fullbody_default.meta.json",
     )?;
     let bundle = load_reference_bundle(
-        "tests/reference/fullbody_default.safetensors",
-        "tests/reference/fullbody_default.meta.json",
+        "assets/model/fullbody_default.safetensors",
+        "assets/model/fullbody_default.meta.json",
     )?;
 
     for case in &bundle.cases {

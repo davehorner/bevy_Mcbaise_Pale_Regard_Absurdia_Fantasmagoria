@@ -3,7 +3,7 @@ Exports deterministic reference outputs from the Python Anny implementation.
 
 This locks golden tensors that the Rust/Burn port must reproduce numerically.
 Outputs are written to a safetensors file (plus small JSON metadata) under
-`tests/reference/`.
+`assets/model/`.
 """
 
 from __future__ import annotations
