@@ -1,5 +1,7 @@
 # bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria
 
+<https://davehorner.github.io/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/>
+
 Forked from https://github.com/mosure/burn_human.git
 
 Bevy port of the CodePen https://codepen.io/Dave-Horner/pen/zxqgOOo “absurdia -stuck in an endless loop in mcdonalds playground slide” visualization, using `bevy_burn_human` as the moving subject.

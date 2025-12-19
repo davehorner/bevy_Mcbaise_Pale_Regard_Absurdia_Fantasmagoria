@@ -15,6 +15,34 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Ensure reference assets (macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f assets/model/fullbody_default.safetensors ]; then
+            exit 0
+          fi
+          url="https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/releases/download/assets/mcbaise_assets.zip"
+          echo "Downloading $url"
+          curl -fsSL "$url" -o mcbaise_assets.zip
+          unzip -oq mcbaise_assets.zip
+          rm -f mcbaise_assets.zip
+          test -f assets/model/fullbody_default.safetensors
+
+      - name: Ensure reference assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          if (Test-Path "assets\model\fullbody_default.safetensors") { exit 0 }
+          $url = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/releases/download/assets/mcbaise_assets.zip"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "mcbaise_assets.zip"
+          Expand-Archive -Force -Path "mcbaise_assets.zip" -DestinationPath "."
+          Remove-Item -Force "mcbaise_assets.zip"
+          if (-not (Test-Path "assets\model\fullbody_default.safetensors")) { throw "asset missing after extract" }
+
       - uses: brndnmtthws/rust-action@v1
         with:
           toolchain: ${{ matrix.toolchain }}
