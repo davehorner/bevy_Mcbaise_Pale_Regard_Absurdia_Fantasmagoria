@@ -36,6 +36,44 @@ tasks:
     cmds:
       - cargo run -p {{.MCBAISE_CRATE}}
 
+  mcbaise:native:youtube:
+    desc: Alias for mcbaise:native:youtube:fresh
+    cmds:
+      - task: mcbaise:native:youtube:fresh
+
+  mcbaise:native:youtube:fresh:
+    desc: Run native tube ride + sync playback from YouTube via WebDriver (fresh Chrome profile)
+    env:
+      MCBAISE_NATIVE_YOUTUBE: "1"
+      MCBAISE_LAUNCH_WEBDRIVER: "1"
+      MCBAISE_CHROME_COOKIES_TXT: '{{default "" .CHROME_COOKIES_TXT}}'
+    cmds:
+      - cargo run -p {{.MCBAISE_CRATE}} --features native-youtube
+
+  mcbaise:native:youtube:default-profile:
+    desc: Run native tube ride + YouTube sync using your default Chrome profile (logged-in cookies)
+    env:
+      MCBAISE_NATIVE_YOUTUBE: "1"
+      MCBAISE_LAUNCH_WEBDRIVER: "1"
+      MCBAISE_CHROME_USER_DATA_DIR: '{{.LOCALAPPDATA}}\Google\Chrome\User Data'
+      MCBAISE_CHROME_PROFILE_DIR: Default
+      MCBAISE_CHROME_COOKIES_TXT: '{{default "" .CHROME_COOKIES_TXT}}'
+    cmds:
+      - cargo run -p {{.MCBAISE_CRATE}} --features native-youtube
+
+  mcbaise:native:mpv:
+    desc: Run native tube ride + sync playback from mpv (YouTube via yt-dlp)
+    env:
+      MCBAISE_NATIVE_MPV: "1"
+      MCBAISE_MPV_URL: '{{default "" .MPV_URL}}'
+      MCBAISE_MPV_PATH: '{{default "" .MPV_PATH}}'
+      MCBAISE_MPV_EXTRA_ARGS: '{{default "" .MPV_EXTRA_ARGS}}'
+      MCBAISE_MPV_COOKIES_FILE: '{{default "" .MPV_COOKIES_FILE}}'
+      MCBAISE_MPV_COOKIES_FROM_BROWSER: '{{default "" .MPV_COOKIES_FROM_BROWSER}}'
+      MCBAISE_MPV_YTDL_RAW_OPTIONS: '{{default "" .MPV_YTDL_RAW_OPTIONS}}'
+    cmds:
+      - cargo run -p {{.MCBAISE_CRATE}} --features native-mpv
+
   mcbaise:wasm:toolchain:
     desc: Ensure Rust wasm target is installed
     cmds:

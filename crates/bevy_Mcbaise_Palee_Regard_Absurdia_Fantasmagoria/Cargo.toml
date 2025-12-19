@@ -16,6 +16,8 @@ exclude = [
 [features]
 default = ["native"]
 native = ["bevy/multi_threaded"]
+native-youtube = ["dep:fantoccini", "dep:tokio", "dep:serde_json", "dep:url", "dep:time"]
+native-mpv = ["dep:tokio", "dep:serde_json"]
 
 [dependencies]
 bevy = { version = "0.17", default-features = false, features = [
@@ -30,6 +32,7 @@ bevy = { version = "0.17", default-features = false, features = [
     "bevy_pbr",
     "bevy_render",
     "bevy_post_process",
+    "bevy_picking",
     "bevy_sprite",
     "bevy_text",
     "bevy_ui",
@@ -51,3 +54,10 @@ fastrand = "2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+fantoccini = { version = "0.21", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"], optional = true }
+serde_json = { version = "1", optional = true }
+url = { version = "2", optional = true }
+time = { version = "0.3", optional = true }

@@ -153,6 +153,7 @@
       </div>
 
       <div id="controls">
+        <button id="btn-overlay">Toggle Overlay</button>
         <button id="btn-colors">Toggle Colors</button>
         <button id="btn-texture">Toggle Texture</button>
         <button id="btn-speed-up">Speed Up</button>
@@ -168,7 +169,8 @@
     const captionEl = document.getElementById("caption");
 
     // Called from Rust (wasm) to update overlays.
-    window.mcbaise_set_credit = (html, show) => {
+    // Important: wasm-bindgen glue runs in ES module scope; refer to these via `globalThis.*`.
+    globalThis.mcbaise_set_credit = (html, show) => {
       if (!show) {
         creditEl.classList.remove("show", "wobble");
         creditEl.innerHTML = "";
@@ -178,7 +180,7 @@
       creditEl.classList.add("show", "wobble");
     };
 
-    window.mcbaise_set_caption = (text, show, isMeta) => {
+    globalThis.mcbaise_set_caption = (text, show, isMeta) => {
       if (!show) {
         captionEl.classList.remove("show", "meta");
         captionEl.textContent = "";
@@ -203,10 +205,13 @@
     // Boot wasm.
     let wasm = null;
     async function bootWasm() {
-      const mod = await import('./pkg/bevy_mcbaise_fantasmagoria.js');
+      // Bust cache for both the JS glue and the wasm binary.
+      // This prevents running an older cached glue file that may still reference missing globals.
+      const v = Date.now().toString();
+      const mod = await import(`./pkg/bevy_mcbaise_fantasmagoria.js?v=${v}`);
       // wasm-bindgen requires explicit initialization; otherwise exports will exist but call into
       // an uninitialized internal `wasm` instance.
-      await mod.default();
+      await mod.default(`./pkg/bevy_mcbaise_fantasmagoria_bg.wasm?v=${v}`);
       wasm = mod;
     }
 
@@ -215,6 +220,22 @@
     let playerReady = false;
     let isPlaying = false;
     let rafId = null;
+    let pendingPlayingRequest = null;
+
+    // Called from Rust (wasm) to request play/pause.
+    // Note: may be called before the YouTube player is ready.
+    globalThis.mcbaise_request_playing = (playing) => {
+      const want = !!playing;
+      pendingPlayingRequest = want;
+
+      if (!playerReady || !player) return;
+      try {
+        if (want) player.playVideo?.();
+        else player.pauseVideo?.();
+      } catch (e) {
+        console.warn('mcbaise_request_playing failed', e);
+      }
+    };
 
     function startLoop() {
       if (rafId) return;
@@ -243,6 +264,15 @@
             playerReady = true;
             const t = player.getCurrentTime?.() ?? 0;
             wasm?.set_video_time?.(t, false);
+
+            if (pendingPlayingRequest !== null) {
+              try {
+                if (pendingPlayingRequest) player.playVideo?.();
+                else player.pauseVideo?.();
+              } catch (e) {
+                console.warn('mcbaise_request_playing (deferred) failed', e);
+              }
+            }
           },
           onStateChange: (e) => {
             if (e.data === YT.PlayerState.PLAYING) {
@@ -261,6 +291,7 @@
 
     // Hook buttons to wasm exports.
     function hookControls() {
+      document.getElementById('btn-overlay').onclick = () => wasm?.toggle_overlay?.();
       document.getElementById('btn-colors').onclick = () => wasm?.toggle_color_scheme?.();
       document.getElementById('btn-texture').onclick = () => wasm?.toggle_texture?.();
       document.getElementById('btn-speed-up').onclick = () => wasm?.speed_up?.();
