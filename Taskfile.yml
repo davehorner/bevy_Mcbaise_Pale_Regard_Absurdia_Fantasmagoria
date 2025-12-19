@@ -36,6 +36,17 @@ tasks:
     cmds:
       - cargo run -p {{.MCBAISE_CRATE}}
 
+  mcbaise:assets:preflight:
+    desc: Test native asset auto-download (downloads/extracts if needed, prints paths, exits)
+    env:
+      MCBAISE_ASSETS_PREFLIGHT: "1"
+    cmds:
+      - cargo run -p {{.MCBAISE_CRATE}}
+  mcbaise:assets:self-test:
+    desc: Cross-platform Rust self-test for asset download (forces download, verifies files, restores local assets)
+    cmds:
+      - cargo run -p {{.MCBAISE_CRATE}} -- --assets-self-test
+
   mcbaise:native:youtube:
     desc: Alias for mcbaise:native:youtube:fresh
     cmds:

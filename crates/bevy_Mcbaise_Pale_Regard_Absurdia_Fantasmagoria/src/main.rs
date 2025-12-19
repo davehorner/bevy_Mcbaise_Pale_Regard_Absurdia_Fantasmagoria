@@ -11,7 +11,6 @@ use bevy_egui::{egui, EguiContexts, EguiPlugin, EguiPrimaryContextPass};
 #[cfg(not(target_arch = "wasm32"))]
 use bevy::window::PrimaryWindow;
 
-#[cfg(target_arch = "wasm32")]
 use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
 
@@ -22,9 +21,11 @@ mod native_assets;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 #[cfg(target_arch = "wasm32")]
-const TENSOR_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.safetensors");
-#[cfg(target_arch = "wasm32")]
 const META_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.meta.json");
+
+#[cfg(target_arch = "wasm32")]
+const TENSOR_LZ4_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/fullbody_default.safetensors.lz4"));
 
 const VIDEO_ID: &str = "v2hcW03gcus";
 
@@ -1745,12 +1746,161 @@ pub fn main() {
     #[cfg(target_arch = "wasm32")]
     console_error_panic_hook::set_once();
 
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        fn truthy_env(name: &str) -> bool {
+            std::env::var(name)
+                .ok()
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+        }
+
+        fn assets_self_test() {
+            use std::fs;
+            use std::io;
+            use std::path::{Path, PathBuf};
+            use std::time::{SystemTime, UNIX_EPOCH};
+
+            fn exists_file(p: &Path) -> bool {
+                fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
+            }
+
+            fn ensure_parent(p: &Path) -> io::Result<()> {
+                if let Some(parent) = p.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                Ok(())
+            }
+
+            let local_tensor = PathBuf::from("assets/model/fullbody_default.safetensors");
+            let local_meta = PathBuf::from("assets/model/fullbody_default.meta.json");
+
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let backup_dir = PathBuf::from(format!(".tmp/mcbaise_assets_self_test_{ts}"));
+            let backup_tensor = backup_dir.join("fullbody_default.safetensors");
+            let backup_meta = backup_dir.join("fullbody_default.meta.json");
+
+            let had_tensor = exists_file(&local_tensor);
+            let had_meta = exists_file(&local_meta);
+
+            if had_tensor || had_meta {
+                let _ = fs::create_dir_all(&backup_dir);
+            }
+
+            // Move local assets aside (if present) so we test the download/cache path.
+            if had_tensor {
+                let _ = ensure_parent(&backup_tensor);
+                fs::rename(&local_tensor, &backup_tensor)
+                    .unwrap_or_else(|e| panic!("failed to move {}: {e}", local_tensor.display()));
+            }
+            if had_meta {
+                let _ = ensure_parent(&backup_meta);
+                fs::rename(&local_meta, &backup_meta)
+                    .unwrap_or_else(|e| panic!("failed to move {}: {e}", local_meta.display()));
+            }
+
+            struct Restore {
+                local_tensor: PathBuf,
+                local_meta: PathBuf,
+                backup_dir: PathBuf,
+                backup_tensor: PathBuf,
+                backup_meta: PathBuf,
+                had_tensor: bool,
+                had_meta: bool,
+            }
+            impl Drop for Restore {
+                fn drop(&mut self) {
+                    if self.had_tensor {
+                        let _ = fs::create_dir_all(self.local_tensor.parent().unwrap_or(Path::new(".")));
+                        let _ = fs::rename(&self.backup_tensor, &self.local_tensor);
+                    }
+                    if self.had_meta {
+                        let _ = fs::create_dir_all(self.local_meta.parent().unwrap_or(Path::new(".")));
+                        let _ = fs::rename(&self.backup_meta, &self.local_meta);
+                    }
+                    let _ = fs::remove_dir_all(&self.backup_dir);
+                }
+            }
+
+            let _restore = Restore {
+                local_tensor,
+                local_meta,
+                backup_dir: backup_dir.clone(),
+                backup_tensor,
+                backup_meta,
+                had_tensor,
+                had_meta,
+            };
+
+            // Force download even if cache already exists.
+            // NOTE: Rust 2024 makes env mutation unsafe; this runs before Bevy spawns threads.
+            unsafe {
+                std::env::set_var("MCBAISE_ASSETS_AUTO_DOWNLOAD", "1");
+                std::env::set_var("MCBAISE_ASSETS_FORCE_DOWNLOAD", "1");
+            }
+
+            let src = native_assets::resolve_burn_human_source();
+            match src {
+                BurnHumanSource::Paths { tensor, meta } => {
+                    if !exists_file(&tensor) {
+                        panic!("assets self-test failed: tensor missing at {}", tensor.display());
+                    }
+                    if !exists_file(&meta) {
+                        panic!("assets self-test failed: meta missing at {}", meta.display());
+                    }
+                    eprintln!("[mcbaise] assets self-test ok");
+                    eprintln!("[mcbaise] tensor: {}", tensor.display());
+                    eprintln!("[mcbaise] meta:   {}", meta.display());
+                }
+                BurnHumanSource::Bytes { .. } => {
+                    eprintln!("[mcbaise] assets self-test ok (embedded bytes)");
+                }
+                BurnHumanSource::Preloaded(_) => {
+                    eprintln!("[mcbaise] assets self-test ok (preloaded)");
+                }
+            }
+        }
+
+        let args: Vec<String> = std::env::args().collect();
+        let self_test = args.iter().any(|a| a == "--assets-self-test");
+        if self_test {
+            assets_self_test();
+            return;
+        }
+
+        // Env-var preflight: download/resolve + print paths, then exit.
+        let preflight = truthy_env("MCBAISE_ASSETS_PREFLIGHT");
+        if preflight {
+            let src = native_assets::resolve_burn_human_source();
+            match src {
+                BurnHumanSource::Paths { tensor, meta } => {
+                    eprintln!("[mcbaise] assets preflight ok");
+                    eprintln!("[mcbaise] tensor: {}", tensor.display());
+                    eprintln!("[mcbaise] meta:   {}", meta.display());
+                }
+                BurnHumanSource::Bytes { .. } => {
+                    eprintln!("[mcbaise] assets preflight ok (embedded bytes)");
+                }
+                BurnHumanSource::Preloaded(_) => {
+                    eprintln!("[mcbaise] assets preflight ok (preloaded)");
+                }
+            }
+            return;
+        }
+    }
+
     let burn_plugin = {
         #[cfg(target_arch = "wasm32")]
         {
+            let tensor_vec = lz4_flex::decompress_size_prepended(TENSOR_LZ4_BYTES)
+                .expect("decompress embedded burn_human tensor (lz4)");
+            let tensor: &'static [u8] = Box::leak(tensor_vec.into_boxed_slice());
             BurnHumanPlugin {
                 source: BurnHumanSource::Bytes {
-                    tensor: TENSOR_BYTES,
+                    tensor,
                     meta: META_BYTES,
                 },
             }

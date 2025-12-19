@@ -140,7 +140,12 @@ pub fn resolve_burn_human_source() -> BurnHumanSource {
     let cached_tensor = cache_assets_root.join("model/fullbody_default.safetensors");
     let cached_meta = cache_assets_root.join("model/fullbody_default.meta.json");
 
-    if file_exists(&cached_tensor) && file_exists(&cached_meta) {
+    let force_download = std::env::var("MCBAISE_ASSETS_FORCE_DOWNLOAD")
+        .ok()
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if !force_download && file_exists(&cached_tensor) && file_exists(&cached_meta) {
         return BurnHumanSource::Paths {
             tensor: cached_tensor,
             meta: cached_meta,
@@ -159,7 +164,12 @@ pub fn resolve_burn_human_source() -> BurnHumanSource {
         );
     }
 
-    eprintln!("[mcbaise] BurnHuman assets not found; downloading {zip_url} ...");
+    if force_download {
+        eprintln!("[mcbaise] forcing assets download: {zip_url}");
+    } else {
+        eprintln!("[mcbaise] BurnHuman assets not found; downloading {zip_url} ...");
+    }
+    eprintln!("[mcbaise] cache dir: {}", cache_root.display());
 
     ensure_dir(&cache_assets_root).unwrap_or_else(|e| {
         panic!("failed to create cache dir {}: {e}", cache_assets_root.display())

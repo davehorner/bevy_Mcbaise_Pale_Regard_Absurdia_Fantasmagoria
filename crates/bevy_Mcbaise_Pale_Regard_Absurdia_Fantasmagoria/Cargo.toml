@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 readme = "README.md"
 homepage = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
 repository = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
+build = "build.rs"
 publish = true
 exclude = [
     "www/pkg/**",
@@ -54,6 +55,7 @@ fastrand = "2"
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"
 wasm-bindgen = "0.2"
+lz4_flex = { version = "0.11", default-features = false }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 fantoccini = { version = "0.21", optional = true }
@@ -66,3 +68,6 @@ directories = "5"
 sha2 = "0.10"
 ureq = { version = "2", default-features = true, features = ["tls", "gzip"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+lz4_flex = { version = "0.11", default-features = false }
