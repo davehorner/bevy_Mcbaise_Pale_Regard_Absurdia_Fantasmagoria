@@ -1,5 +1,11 @@
 name: deploy-web
 
+# This workflow deploys the wasm demo to GitHub Pages.
+# It also publishes the native BurnHuman model assets as a Release attachment.
+#
+# The assets Release is only updated when the exported model content differs from the last
+# published assets Release.
+
 on:
   workflow_dispatch:
 
@@ -8,7 +14,7 @@ on:
       - main
 
 permissions:
-  contents: read
+  contents: write
   pages: write
   id-token: write
 
@@ -41,6 +47,74 @@ jobs:
       - name: Export reference assets
         run: python tool/scripts/export_reference.py --output assets/model/fullbody_default.safetensors --seed 1234
 
+      - name: Compute assets content hash
+        id: assets_hash
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum assets/model/fullbody_default.safetensors assets/model/fullbody_default.meta.json > mcbaise_assets.content.sha256sums
+          HASH=$(sha256sum mcbaise_assets.content.sha256sums | awk '{print $1}')
+          echo "$HASH" > mcbaise_assets.tree.sha256
+          echo "hash=$HASH" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch latest assets release hash (if any)
+        id: latest_assets_release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          URL=$(gh release view assets --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[] | select(.name=="mcbaise_assets.tree.sha256") | .browser_download_url' 2>/dev/null || true)
+          if [ -z "${URL:-}" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          curl -fsSL "$URL" -o latest.mcbaise_assets.tree.sha256
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "hash=$(tr -d '\r\n ' < latest.mcbaise_assets.tree.sha256)" >> "$GITHUB_OUTPUT"
+
+      - name: Decide whether to update assets release
+        id: should_release_assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          NEW='${{ steps.assets_hash.outputs.hash }}'
+          if [ "${{ steps.latest_assets_release.outputs.found }}" != "true" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          OLD='${{ steps.latest_assets_release.outputs.hash }}'
+          if [ "$NEW" != "$OLD" ]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create mcbaise_assets.zip
+        if: steps.should_release_assets.outputs.changed == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f mcbaise_assets.zip
+          zip -q mcbaise_assets.zip assets/model/fullbody_default.safetensors assets/model/fullbody_default.meta.json
+
+      - name: Publish/update "assets" release (only if changed)
+        if: steps.should_release_assets.outputs.changed == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: assets
+          name: assets
+          make_latest: false
+          body: |
+            BurnHuman reference model assets for native runs.
+
+            Commit: ${{ github.sha }}
+            Content SHA256 (tree): ${{ steps.assets_hash.outputs.hash }}
+          files: |
+            mcbaise_assets.zip
+            mcbaise_assets.tree.sha256
+            mcbaise_assets.content.sha256sums
+
       - uses: dtolnay/rust-toolchain@stable
       - name: Add wasm target
         run: rustup target add wasm32-unknown-unknown
@@ -51,14 +125,14 @@ jobs:
       - name: Run wasm-bindgen
         run: >
           wasm-bindgen --target web --no-typescript
-          --out-dir crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/www/pkg
+          --out-dir crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www/pkg
           --out-name bevy_mcbaise_fantasmagoria
           target/wasm32-unknown-unknown/wasm-release/bevy_mcbaise_fantasmagoria.wasm
       - name: Copy assets
         run: |
-          mkdir -p crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/www/assets
+          mkdir -p crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www/assets
           if compgen -G "assets/*" > /dev/null; then
-            cp -r assets/* crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/www/assets/
+            cp -r assets/* crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www/assets/
           fi
 
       - name: Configure Pages
@@ -67,7 +141,7 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/www
+          path: crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www
 
       - name: Deploy to GitHub Pages
         id: deployment

@@ -15,6 +15,9 @@ use bevy::window::PrimaryWindow;
 use bevy_burn_human::BurnHumanSource;
 use bevy_burn_human::{BurnHumanAssets, BurnHumanInput, BurnHumanPlugin};
 
+#[cfg(not(target_arch = "wasm32"))]
+mod native_assets;
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::wasm_bindgen;
 
@@ -1754,7 +1757,9 @@ pub fn main() {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            BurnHumanPlugin::default()
+            BurnHumanPlugin {
+                source: native_assets::resolve_burn_human_source(),
+            }
         }
     };
 

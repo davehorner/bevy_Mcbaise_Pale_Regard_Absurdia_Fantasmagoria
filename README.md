@@ -1,9 +1,9 @@
-# bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria
+# bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria
 
 Forked from https://github.com/mosure/burn_human.git
 
 <p align="center">
-    <img alt="Tube ride screenshot" src="https://raw.githubusercontent.com/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/main/screenshot.jpg" />
+    <img alt="Tube ride screenshot" src="https://raw.githubusercontent.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/main/screenshot.jpg" />
 </p>
 
 [![test](https://github.com/mosure/burn_human/workflows/test/badge.svg)](https://github.com/Mosure/burn_human/actions?query=workflow%3Atest)
@@ -82,7 +82,7 @@ task demo:native
 
 Bevy port of a Three.js “tube ride” demo that drives the camera/animation from YouTube time when running on wasm.
 
-- Crate: `crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria`
+- Crate: `crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria`
 
 Native:
 
@@ -108,18 +108,18 @@ Notes:
 This repo includes a workflow that builds and publishes the tube ride demo to GitHub Pages using the official Pages Actions.
 
 - Workflow: `.github/workflows/deploy.yml`
-- Pages URL (project pages): `https://davehorner.github.io/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/`
+- Pages URL (project pages): `https://davehorner.github.io/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/`
 
 Enable Pages (create if missing; uses GitHub Actions as the build source):
 
 ```bash
-gh api -X POST repos/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/pages -f build_type=workflow
+gh api -X POST repos/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/pages -f build_type=workflow
 ```
 
 Or update an existing Pages config:
 
 ```bash
-gh api -X PUT repos/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/pages -f build_type=workflow
+gh api -X PUT repos/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/pages -f build_type=workflow
 ```
 
 Deploy happens automatically on pushes to `main`, or you can trigger it manually in Actions (workflow `deploy-web`).

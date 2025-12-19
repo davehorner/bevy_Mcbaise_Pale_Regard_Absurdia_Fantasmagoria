@@ -1,13 +1,13 @@
 [package]
 name = "bevy_mcbaise_fantasmagoria"
-description = "bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria — Bevy port of a tube-ride visualization"
+description = "bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria — Bevy port of a tube-ride visualization"
 version = "0.1.0"
 edition = "2024"
 authors = ["Dave Horner"]
 license = "MIT OR Apache-2.0"
 readme = "README.md"
-homepage = "https://github.com/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria"
-repository = "https://github.com/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria"
+homepage = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
+repository = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
 publish = true
 exclude = [
     "www/pkg/**",
@@ -61,3 +61,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "time", "net", "io-util"
 serde_json = { version = "1", optional = true }
 url = { version = "2", optional = true }
 time = { version = "0.3", optional = true }
+
+directories = "5"
+sha2 = "0.10"
+ureq = { version = "2", default-features = true, features = ["tls", "gzip"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }

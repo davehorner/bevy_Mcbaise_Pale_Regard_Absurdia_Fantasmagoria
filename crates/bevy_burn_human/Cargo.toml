@@ -5,8 +5,8 @@ version = "0.1.0"
 edition = "2024"
 authors = ["Dave Horner", "mosure <mitchell@mosure.me>"]
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria"
-repository = "https://github.com/davehorner/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria"
+homepage = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
+repository = "https://github.com/davehorner/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria"
 publish = true
 
 [features]

@@ -3,7 +3,7 @@ version: '3'
 vars:
   MCBAISE_CRATE: bevy_mcbaise_fantasmagoria
   MCBAISE_WASM_TARGET: wasm32-unknown-unknown
-  MCBAISE_WWW_DIR: crates/bevy_Mcbaise_Palee_Regard_Absurdia_Fantasmagoria/www
+  MCBAISE_WWW_DIR: crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/www
   MCBAISE_WASM_PROFILE: wasm-release
   MCBAISE_PORT: '5173'
 
