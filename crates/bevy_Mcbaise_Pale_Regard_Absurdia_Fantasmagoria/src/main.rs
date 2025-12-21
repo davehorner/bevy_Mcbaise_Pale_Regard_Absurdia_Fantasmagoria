@@ -5359,12 +5359,12 @@ fn ui_overlay(
             let now_sec = time.elapsed().as_secs_f64();
             if resp.clicked_by(egui::PointerButton::Primary) {
                 if !multi_view.increment() {
-                    multi_view_hint.show(now_sec, "right click to remove");
+                    multi_view_hint.show(now_sec, "right click (or tap & hold) to remove");
                 }
             } else if (resp.clicked_by(egui::PointerButton::Secondary) || resp.long_touched())
                 && !multi_view.decrement()
             {
-                multi_view_hint.show(now_sec, "left click to add more");
+                multi_view_hint.show(now_sec, "left click/tap to add more");
             }
         });
 
