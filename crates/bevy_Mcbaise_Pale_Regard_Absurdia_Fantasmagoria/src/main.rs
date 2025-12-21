@@ -2019,6 +2019,12 @@ struct AutoCameraState {
     since_switch_sec: f32,
     next_switch_sec: f32,
     current: CameraMode,
+    subject_distance: f32,
+    last_effective_mode: CameraMode,
+    mode_since_sec: f32,
+    pass_anchor_progress: f32,
+    pass_anchor_valid: bool,
+    pass_reanchor_since_sec: f32,
 }
 
 #[derive(Resource, Clone, Copy)]
@@ -2174,8 +2180,14 @@ impl Default for AutoCameraState {
             since_switch_sec: 0.0,
             next_switch_sec: 0.0,
             current: CameraMode::BallChase,
+            subject_distance: 5.0,
+            last_effective_mode: CameraMode::BallChase,
+            mode_since_sec: 0.0,
+            pass_anchor_progress: 0.0,
+            pass_anchor_valid: false,
+            pass_reanchor_since_sec: 0.0,
         };
-        s.schedule_next_switch();
+        s.apply_mode_params(s.current);
         s
     }
 }
@@ -2196,10 +2208,22 @@ impl AutoCameraState {
         a + (b - a) * self.rand01()
     }
 
-    fn schedule_next_switch(&mut self) {
-        // Change every 3–6 seconds (uniform), i.e. ~4.5s average.
+    fn apply_mode_params(&mut self, mode: CameraMode) {
+        let (min_sec, max_sec) = mode.suggested_duration_range_sec();
+        // Fallback if a mode doesn't specify anything.
+        let (min_sec, max_sec) = if max_sec > 0.0 {
+            (min_sec, max_sec)
+        } else {
+            (3.0, 6.0)
+        };
+
         self.since_switch_sec = 0.0;
-        self.next_switch_sec = self.rand_range(3.0, 6.0);
+        self.next_switch_sec = self.rand_range(min_sec, max_sec);
+
+        let (dmin, dmax) = mode.distance_range_to_subject();
+        if dmax > 0.0 {
+            self.subject_distance = self.rand_range(dmin, dmax);
+        }
     }
 
     fn pick_next_mode(&mut self) -> CameraMode {
@@ -2211,6 +2235,12 @@ impl AutoCameraState {
             CameraMode::Back,
             CameraMode::BallChase,
             CameraMode::Side,
+            CameraMode::FocusedChase,
+            CameraMode::FocusedSide,
+            CameraMode::PassingLeft,
+            CameraMode::PassingRight,
+            CameraMode::PassingTop,
+            CameraMode::PassingBottom,
         ];
 
         // Try a few times to avoid repeats.
@@ -2230,6 +2260,12 @@ impl AutoCameraState {
             CameraMode::Side => CameraMode::First,
             CameraMode::First => CameraMode::Over,
             CameraMode::Over => CameraMode::BallChase,
+            CameraMode::FocusedChase => CameraMode::FocusedSide,
+            CameraMode::FocusedSide => CameraMode::PassingLeft,
+            CameraMode::PassingLeft => CameraMode::PassingRight,
+            CameraMode::PassingRight => CameraMode::PassingTop,
+            CameraMode::PassingTop => CameraMode::PassingBottom,
+            CameraMode::PassingBottom => CameraMode::FocusedChase,
         }
     }
 }
@@ -4173,8 +4209,9 @@ fn update_tube_and_subject(
         CameraPreset::Random => {
             auto_cam.since_switch_sec += dt;
             if auto_cam.since_switch_sec >= auto_cam.next_switch_sec {
-                auto_cam.current = auto_cam.pick_next_mode();
-                auto_cam.schedule_next_switch();
+                let next_mode = auto_cam.pick_next_mode();
+                auto_cam.current = next_mode;
+                auto_cam.apply_mode_params(next_mode);
             }
             auto_cam.current
         }
@@ -4185,7 +4222,47 @@ fn update_tube_and_subject(
         CameraPreset::FollowActiveChase
         | CameraPreset::FollowHumanChase
         | CameraPreset::FollowBallChase => CameraMode::BallChase,
+        CameraPreset::FollowActiveFocusedChase => CameraMode::FocusedChase,
+        CameraPreset::FollowActiveFocusedSide => CameraMode::FocusedSide,
+        CameraPreset::PassingLeft => CameraMode::PassingLeft,
+        CameraPreset::PassingRight => CameraMode::PassingRight,
+        CameraPreset::PassingTop => CameraMode::PassingTop,
+        CameraPreset::PassingBottom => CameraMode::PassingBottom,
     };
+
+    let mode_changed = selected_camera_mode != auto_cam.last_effective_mode;
+    if mode_changed {
+        auto_cam.mode_since_sec = 0.0;
+    } else {
+        auto_cam.mode_since_sec += dt;
+    }
+
+    // Passing modes need a stable camera anchor so the subject can pass through frame.
+    // Anchor when entering a passing mode and periodically while it remains active,
+    // so the subject repeatedly rolls into view instead of leaving us staring at a wall.
+    if mode_changed {
+        if selected_camera_mode.is_passing() {
+            // Anchor very close to current progress so the shot reads immediately.
+            let lead_u = 0.010;
+            auto_cam.pass_anchor_progress = (progress + lead_u).rem_euclid(1.0);
+            auto_cam.pass_anchor_valid = true;
+            auto_cam.pass_reanchor_since_sec = 0.0;
+        } else {
+            auto_cam.pass_anchor_valid = false;
+        }
+        auto_cam.last_effective_mode = selected_camera_mode;
+    }
+
+    if selected_camera_mode.is_passing() {
+        auto_cam.pass_reanchor_since_sec += dt;
+        // Roughly once per second, re-anchor to the current progress.
+        if auto_cam.pass_reanchor_since_sec >= 1.0 {
+            let lead_u = 0.010;
+            auto_cam.pass_anchor_progress = (progress + lead_u).rem_euclid(1.0);
+            auto_cam.pass_anchor_valid = true;
+            auto_cam.pass_reanchor_since_sec = 0.0;
+        }
+    }
 
     // Subject position on wall.
     let ball_ahead = if selected_camera_mode == CameraMode::BallChase {
@@ -4473,11 +4550,29 @@ fn update_tube_and_subject(
     }
 
     if let Ok(mut cam_tr) = cam.single_mut() {
+        let random_subject_distance = if *camera_preset == CameraPreset::Random {
+            Some(auto_cam.subject_distance)
+        } else {
+            None
+        };
+
+        let pass_anchor = if selected_camera_mode.is_passing() && auto_cam.pass_anchor_valid {
+            let u = auto_cam.pass_anchor_progress;
+            let c = tube_scene.curve.point_at(u);
+            let fr = tube_scene.frames.frame_at(u);
+            Some((c, fr.tan, fr.nor, fr.bin))
+        } else {
+            None
+        };
+
         let (pos, look, up) = camera_pose(
             t,
             *camera_preset,
             selected_camera_mode,
             active_subject_mode,
+            auto_cam.mode_since_sec,
+            random_subject_distance,
+            pass_anchor,
             cam_center,
             look_ahead,
             cam_tangent,
@@ -5254,6 +5349,27 @@ fn ui_overlay(
                                 }
                             }
                         });
+
+                    let effective_mode = match *camera_preset {
+                        CameraPreset::Auto | CameraPreset::Random => auto_cam.current,
+                        CameraPreset::FollowActiveFirst => CameraMode::First,
+                        CameraPreset::FollowActiveOver | CameraPreset::TubeOver => CameraMode::Over,
+                        CameraPreset::FollowActiveBack => CameraMode::Back,
+                        CameraPreset::FollowActiveSide => CameraMode::Side,
+                        CameraPreset::FollowActiveChase
+                        | CameraPreset::FollowHumanChase
+                        | CameraPreset::FollowBallChase => CameraMode::BallChase,
+                        CameraPreset::FollowActiveFocusedChase => CameraMode::FocusedChase,
+                        CameraPreset::FollowActiveFocusedSide => CameraMode::FocusedSide,
+                        CameraPreset::PassingLeft => CameraMode::PassingLeft,
+                        CameraPreset::PassingRight => CameraMode::PassingRight,
+                        CameraPreset::PassingTop => CameraMode::PassingTop,
+                        CameraPreset::PassingBottom => CameraMode::PassingBottom,
+                    };
+                    let (tmin, tmax) = effective_mode.suggested_duration_range_sec();
+                    if tmax > 0.0 {
+                        ui.label(format!("Suggested: {:.0}–{:.0}s", tmin, tmax));
+                    }
                 });
 
                 ui.horizontal(|ui| {
@@ -5746,6 +5862,9 @@ fn ui_overlay(
                     egui::vec2(wobble_x, 26.0 + wobble_y),
                 )
                 .show(ctx, |ui| {
+                    // Give the credit text plenty of width so it doesn't wrap.
+                    ui.set_min_width(1200.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
                     ui.vertical_centered(|ui| {
                         // Approximate the original styled HTML credits.
                         match overlay_state.last_credit_idx {
@@ -5871,6 +5990,12 @@ enum CameraMode {
     Back,
     BallChase,
     Side,
+    FocusedChase,
+    FocusedSide,
+    PassingLeft,
+    PassingRight,
+    PassingTop,
+    PassingBottom,
 }
 
 impl CameraMode {
@@ -5881,24 +6006,149 @@ impl CameraMode {
             CameraMode::Back => "back",
             CameraMode::BallChase => "chase",
             CameraMode::Side => "side",
+            CameraMode::FocusedChase => "focused chase",
+            CameraMode::FocusedSide => "focused side",
+            CameraMode::PassingLeft => "passing left",
+            CameraMode::PassingRight => "passing right",
+            CameraMode::PassingTop => "passing top",
+            CameraMode::PassingBottom => "passing bottom",
         }
+    }
+
+    fn suggested_duration_range_sec(self) -> (f32, f32) {
+        match self {
+            // Existing behavior.
+            CameraMode::First | CameraMode::Back | CameraMode::BallChase | CameraMode::Side => {
+                (3.0, 6.0)
+            }
+            // Over: hold 1s then move in; prefer a longer hold after the move.
+            CameraMode::Over => (6.5, 6.5),
+
+            // Focused modes benefit from a bit more time to feel intentional.
+            CameraMode::FocusedChase | CameraMode::FocusedSide => (4.0, 7.0),
+
+            // Passing modes need enough time for the subject to traverse the view.
+            CameraMode::PassingLeft
+            | CameraMode::PassingRight
+            | CameraMode::PassingTop
+            | CameraMode::PassingBottom => (0.9, 1.2),
+        }
+    }
+
+    fn distance_range_to_subject(self) -> (f32, f32) {
+        match self {
+            // These don't use a target-centered distance meaningfully.
+            CameraMode::First | CameraMode::Over => (0.0, 0.0),
+
+            // Keep close-ish for readability.
+            CameraMode::Back | CameraMode::BallChase | CameraMode::Side => (4.5, 6.5),
+
+            // Give focused modes room to breathe.
+            CameraMode::FocusedChase | CameraMode::FocusedSide => (5.0, 10.0),
+
+            // Passing shots tend to read better from farther out.
+            CameraMode::PassingLeft
+            | CameraMode::PassingRight
+            | CameraMode::PassingTop
+            | CameraMode::PassingBottom => (9.0, 16.0),
+        }
+    }
+
+    fn is_passing(self) -> bool {
+        matches!(
+            self,
+            CameraMode::PassingLeft
+                | CameraMode::PassingRight
+                | CameraMode::PassingTop
+                | CameraMode::PassingBottom
+        )
     }
 }
 
 fn timeline_camera_mode(video_time_sec: f32) -> CameraMode {
-    // Deterministic timeline camera behavior matching the original CodePen.
-    // cycle=14s; if u>6..8.5 => Over; 8.5..11 => Back; >11 => BallChase; else => First.
-    let cycle = 14.0;
-    let u = video_time_sec.rem_euclid(cycle);
+    // Deterministic timeline camera behavior.
 
-    if u > 6.0 && u <= 8.5 {
-        CameraMode::Over
-    } else if u > 8.5 && u <= 11.0 {
-        CameraMode::Back
-    } else if u > 11.0 {
-        CameraMode::BallChase
+    // Auto should respect the suggested times, but remain deterministic.
+    // We derive a per-mode "preferred" duration from the suggested range:
+    // - fixed range: use that value
+    // - otherwise: midpoint
+    let preferred = |mode: CameraMode| {
+        let (min_sec, max_sec) = mode.suggested_duration_range_sec();
+        if (min_sec - max_sec).abs() < 1e-4 {
+            min_sec
+        } else {
+            0.5 * (min_sec + max_sec)
+        }
+    };
+
+    // Build a deterministic cycle.
+    let first_dur = preferred(CameraMode::First);
+    let over_dur = preferred(CameraMode::Over);
+    let back_dur = preferred(CameraMode::Back);
+    let chase_a_dur = preferred(CameraMode::BallChase);
+    let side_dur = preferred(CameraMode::Side);
+
+    // Alternate focused chase/side each cycle for variety.
+    let focused_mode = CameraMode::FocusedChase;
+    let focused_dur = preferred(focused_mode);
+
+    // Keep passing at ~1s per direction (and within the suggested 0.9..1.2 range).
+    let pass_each_dur = preferred(CameraMode::PassingLeft).clamp(0.9, 1.2);
+
+    let chase_b_dur = preferred(CameraMode::BallChase);
+
+    let cycle = first_dur
+        + over_dur
+        + back_dur
+        + chase_a_dur
+        + side_dur
+        + focused_dur
+        + pass_each_dur * 4.0
+        + chase_b_dur;
+
+    let u = video_time_sec.rem_euclid(cycle);
+    let cycle_idx = (video_time_sec / cycle).floor() as i32;
+
+    let focused_mode = if (cycle_idx & 1) == 0 {
+        CameraMode::FocusedChase
     } else {
-        CameraMode::First
+        CameraMode::FocusedSide
+    };
+
+    let mut t = u;
+    if t < first_dur {
+        return CameraMode::First;
+    }
+    t -= first_dur;
+    if t < over_dur {
+        return CameraMode::Over;
+    }
+    t -= over_dur;
+    if t < back_dur {
+        return CameraMode::Back;
+    }
+    t -= back_dur;
+    if t < chase_a_dur {
+        return CameraMode::BallChase;
+    }
+    t -= chase_a_dur;
+    if t < side_dur {
+        return CameraMode::Side;
+    }
+    t -= side_dur;
+    if t < focused_dur {
+        return focused_mode;
+    }
+    t -= focused_dur;
+
+    // Passing: 4 directions, each for pass_each_dur.
+    let idx = (t / pass_each_dur).floor().clamp(0.0, 3.0) as i32;
+    match idx {
+        0 => CameraMode::PassingLeft,
+        1 => CameraMode::PassingRight,
+        2 => CameraMode::PassingTop,
+        3 => CameraMode::PassingBottom,
+        _ => CameraMode::BallChase,
     }
 }
 
@@ -5970,6 +6220,12 @@ enum CameraPreset {
     FollowActiveFirst,
     FollowActiveOver,
     FollowActiveSide,
+    FollowActiveFocusedChase,
+    FollowActiveFocusedSide,
+    PassingLeft,
+    PassingRight,
+    PassingTop,
+    PassingBottom,
     FollowHumanChase,
     FollowBallChase,
     TubeOver,
@@ -5985,13 +6241,19 @@ impl CameraPreset {
             CameraPreset::FollowActiveFirst => "Camera: follow active (first)",
             CameraPreset::FollowActiveOver => "Camera: follow active (over)",
             CameraPreset::FollowActiveSide => "Camera: follow active (side)",
+            CameraPreset::FollowActiveFocusedChase => "Camera: follow active (focused chase)",
+            CameraPreset::FollowActiveFocusedSide => "Camera: follow active (focused side)",
+            CameraPreset::PassingLeft => "Camera: passing (left)",
+            CameraPreset::PassingRight => "Camera: passing (right)",
+            CameraPreset::PassingTop => "Camera: passing (top)",
+            CameraPreset::PassingBottom => "Camera: passing (bottom)",
             CameraPreset::FollowHumanChase => "Camera: follow human (chase)",
             CameraPreset::FollowBallChase => "Camera: follow ball (chase)",
             CameraPreset::TubeOver => "Camera: tube overview",
         }
     }
 
-    fn choices() -> [(CameraPreset, &'static str); 10] {
+    fn choices() -> [(CameraPreset, &'static str); 16] {
         [
             (CameraPreset::Auto, CameraPreset::Auto.label()),
             (CameraPreset::Random, CameraPreset::Random.label()),
@@ -6016,6 +6278,24 @@ impl CameraPreset {
                 CameraPreset::FollowActiveSide.label(),
             ),
             (
+                CameraPreset::FollowActiveFocusedChase,
+                CameraPreset::FollowActiveFocusedChase.label(),
+            ),
+            (
+                CameraPreset::FollowActiveFocusedSide,
+                CameraPreset::FollowActiveFocusedSide.label(),
+            ),
+            (CameraPreset::PassingLeft, CameraPreset::PassingLeft.label()),
+            (
+                CameraPreset::PassingRight,
+                CameraPreset::PassingRight.label(),
+            ),
+            (CameraPreset::PassingTop, CameraPreset::PassingTop.label()),
+            (
+                CameraPreset::PassingBottom,
+                CameraPreset::PassingBottom.label(),
+            ),
+            (
                 CameraPreset::FollowHumanChase,
                 CameraPreset::FollowHumanChase.label(),
             ),
@@ -6034,6 +6314,9 @@ fn camera_pose(
     camera_preset: CameraPreset,
     selected_mode: CameraMode,
     subject_mode: SubjectMode,
+    mode_age_sec: f32,
+    random_subject_distance: Option<f32>,
+    pass_anchor: Option<(Vec3, Vec3, Vec3, Vec3)>,
     cam_center: Vec3,
     look_ahead: Vec3,
     cam_tangent: Vec3,
@@ -6092,6 +6375,51 @@ fn camera_pose(
     let side_look = target_pos;
     let side_up = cam_n;
 
+    let focused_base_dist = random_subject_distance.unwrap_or(6.8);
+    // Focused modes should visibly move toward the subject when activated.
+    // Ramp a zoom-in over ~1s.
+    let a = (mode_age_sec / 0.9).clamp(0.0, 1.0);
+    let a = a * a * (3.0 - 2.0 * a); // smoothstep
+    let focused_dist = focused_base_dist * (1.25 - 0.55 * a);
+    let focused_chase_dir = (-subject_tangent * 0.90 + cam_n * 0.28 + cam_b * 0.22)
+        .normalize_or_zero();
+    let focused_chase_pos = target_pos + focused_chase_dir * focused_dist;
+    let focused_chase_look = target_pos + subject_tangent * 1.8;
+    let focused_chase_up = cam_n;
+
+    let focused_side_dir = (cam_b * 0.95 + cam_n * 0.20 - subject_tangent * 0.18)
+        .normalize_or_zero();
+    let focused_side_pos = target_pos + focused_side_dir * focused_dist;
+    let focused_side_look = target_pos + subject_tangent * 1.6;
+    let focused_side_up = cam_n;
+
+    // Passing shot: camera is placed at the tube center and looks forward down the opening.
+    // Direction (left/right/top/bottom) is expressed by a small look-target bias while keeping
+    // the camera centered.
+    let (pass_c, pass_tan, pass_n, pass_b) =
+        pass_anchor.unwrap_or((cam_center, cam_tangent, cam_n, cam_b));
+
+    let pass_up = pass_n;
+    let pass_pos = pass_c + pass_tan * (TUBE_RADIUS * 0.10);
+
+    // Look far down the tube so we read the opening, not the wall.
+    let pass_far = 25.0;
+    let pass_look_center = pass_c + pass_tan * pass_far;
+
+    // Bias the look target slightly to create an on-screen edge preference.
+    let aim = (TUBE_RADIUS * 0.25).clamp(0.6, 1.4);
+    // With forward ~= +tan and up ~= +n, camera-right ~= +b.
+    // To make the subject appear on the LEFT, yaw right (look toward +b).
+    let pass_look_left = pass_look_center + pass_b * aim;
+    let pass_look_right = pass_look_center - pass_b * aim;
+    let pass_look_top = pass_look_center + pass_n * aim;
+    let pass_look_bottom = pass_look_center - pass_n * aim;
+
+    let pass_pos_left = pass_pos;
+    let pass_pos_right = pass_pos;
+    let pass_pos_top = pass_pos;
+    let pass_pos_bottom = pass_pos;
+
     let mut pos;
     let mut look;
     let mut up;
@@ -6104,12 +6432,30 @@ fn camera_pose(
         }
         CameraMode::Over => {
             pos = over_pos;
-            look = if camera_preset == CameraPreset::TubeOver {
+            let base_look = if camera_preset == CameraPreset::TubeOver {
                 cam_center
             } else {
                 over_look
             };
+            look = base_look;
             up = over_up;
+
+            // "Over" should behave like a focused shot: hold the normal framing briefly,
+            // then slowly pan/tilt and move toward the subject.
+            // Keep TubeOver unchanged (it's meant to present the tube itself).
+            if !in_intro && camera_preset != CameraPreset::TubeOver {
+                let hold_sec = 1.0;
+                let move_sec = 2.0;
+                let t = ((mode_age_sec - hold_sec) / move_sec).clamp(0.0, 1.0);
+                let t = t * t * (3.0 - 2.0 * t); // smoothstep
+
+                // End pose: closer and slightly behind, still in the tube frame.
+                let focus_pos = target_pos + cam_n * 12.0 + cam_b * 9.0 + subject_tangent * -1.3;
+                let focus_look = target_pos + subject_tangent * 0.9;
+
+                pos = pos.lerp(focus_pos, t);
+                look = look.lerp(focus_look, t);
+            }
         }
         CameraMode::Back => {
             pos = back_pos;
@@ -6125,6 +6471,36 @@ fn camera_pose(
             pos = side_pos;
             look = side_look;
             up = side_up;
+        }
+        CameraMode::FocusedChase => {
+            pos = focused_chase_pos;
+            look = focused_chase_look;
+            up = focused_chase_up;
+        }
+        CameraMode::FocusedSide => {
+            pos = focused_side_pos;
+            look = focused_side_look;
+            up = focused_side_up;
+        }
+        CameraMode::PassingLeft => {
+            pos = pass_pos_left;
+            look = pass_look_left;
+            up = pass_up;
+        }
+        CameraMode::PassingRight => {
+            pos = pass_pos_right;
+            look = pass_look_right;
+            up = pass_up;
+        }
+        CameraMode::PassingTop => {
+            pos = pass_pos_top;
+            look = pass_look_top;
+            up = pass_up;
+        }
+        CameraMode::PassingBottom => {
+            pos = pass_pos_bottom;
+            look = pass_look_bottom;
+            up = pass_up;
         }
     }
 
@@ -6153,8 +6529,14 @@ fn camera_pose(
     // Only apply to the modes intended to feature the subject.
     if !in_intro {
         match selected_mode {
-            CameraMode::BallChase | CameraMode::Back => {
-                let desired_dist = 5.0;
+            CameraMode::BallChase
+            | CameraMode::Back
+            | CameraMode::FocusedChase
+            | CameraMode::FocusedSide => {
+                let desired_dist = match selected_mode {
+                    CameraMode::FocusedChase | CameraMode::FocusedSide => focused_dist,
+                    _ => random_subject_distance.unwrap_or(5.0),
+                };
                 let dir = (pos - target_pos).normalize_or_zero();
                 if dir.length_squared() > 0.0 {
                     pos = target_pos + dir * desired_dist;
