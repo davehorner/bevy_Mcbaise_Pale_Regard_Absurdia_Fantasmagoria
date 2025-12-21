@@ -49,7 +49,7 @@ bevy = { version = "0.17", default-features = false, features = [
     "zstd_rust",
 ] }
 bevy_egui = "0.38"
-bevy_burn_human = "0.1"
+bevy_burn_human = "0.2"
 fastrand = "2"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

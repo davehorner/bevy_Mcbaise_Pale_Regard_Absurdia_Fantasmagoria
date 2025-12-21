@@ -2397,6 +2397,12 @@ struct CaptionVisibility {
     show: bool,
 }
 
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Clone, Copy)]
+struct VideoVisibility {
+    show: bool,
+}
+
 #[derive(Resource, Clone, Default)]
 struct OverlayText {
     credit: String,
@@ -2501,6 +2507,9 @@ extern "C" {
 
     #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_set_caption)]
     fn mcbaise_set_caption(text: &str, show: bool, is_meta: bool);
+
+    #[wasm_bindgen(js_namespace = globalThis, js_name = mcbaise_set_video_visible)]
+    fn mcbaise_set_video_visible(show: bool);
 }
 
 #[cfg_attr(target_arch = "wasm32", wasm_bindgen(start))]
@@ -2632,6 +2641,26 @@ pub fn main() {
                 BurnHumanSource::Preloaded(_) => {
                     eprintln!("[mcbaise] assets self-test ok (preloaded)");
                 }
+                BurnHumanSource::AssetPath(meta_path) => {
+                    let raw = std::path::PathBuf::from(&meta_path);
+                    let candidate = if exists_file(&raw) {
+                        raw
+                    } else {
+                        std::path::PathBuf::from("assets").join(&meta_path)
+                    };
+
+                    if exists_file(&candidate) {
+                        eprintln!("[mcbaise] assets self-test ok (asset pipeline)");
+                        eprintln!("[mcbaise] meta:   {}", candidate.display());
+                    } else {
+                        eprintln!(
+                            "[mcbaise] assets self-test: meta asset path does not exist on disk: {meta_path}"
+                        );
+                    }
+                }
+                BurnHumanSource::Asset(_) => {
+                    eprintln!("[mcbaise] assets self-test ok (asset pipeline handle)");
+                }
             }
         }
 
@@ -2657,6 +2686,13 @@ pub fn main() {
                 }
                 BurnHumanSource::Preloaded(_) => {
                     eprintln!("[mcbaise] assets preflight ok (preloaded)");
+                }
+                BurnHumanSource::AssetPath(meta_path) => {
+                    eprintln!("[mcbaise] assets preflight ok (asset pipeline)");
+                    eprintln!("[mcbaise] meta:   {meta_path}");
+                }
+                BurnHumanSource::Asset(_) => {
+                    eprintln!("[mcbaise] assets preflight ok (asset pipeline handle)");
                 }
             }
             return;
@@ -2755,8 +2791,12 @@ pub fn main() {
         .init_resource::<SubjectDynamics>()
         .init_resource::<SubjectNormalsComputed>()
         .add_plugins(plugins)
-        .add_plugins(bevy::pbr::wireframe::WireframePlugin::default())
-        .add_plugins(EguiPlugin::default())
+        .add_plugins(bevy::pbr::wireframe::WireframePlugin::default());
+
+    #[cfg(target_arch = "wasm32")]
+    app.insert_resource(VideoVisibility { show: true });
+
+    app.add_plugins(EguiPlugin::default())
         // Ensure embedded assets are registered before materials request shaders.
         .add_plugins(local_embedded_asset_plugin)
         .add_plugins(MaterialPlugin::<TubeMaterial>::default())
@@ -4744,6 +4784,8 @@ fn update_overlays(
     mut overlay_text: ResMut<OverlayText>,
     overlay_vis: Res<OverlayVisibility>,
     caption_vis: Res<CaptionVisibility>,
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+    native_youtube: Option<Res<NativeYoutubeSync>>,
     #[cfg(not(target_arch = "wasm32"))] mut window: Query<&mut Window, With<PrimaryWindow>>,
 ) {
     let t = playback.time_sec;
@@ -4792,12 +4834,30 @@ fn update_overlays(
         }
     }
 
+    #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
+    let waiting_for_play = native_youtube
+        .as_ref()
+        .is_some_and(|s| s.enabled && (!s.has_remote || (!playback.playing && playback.time_sec < 0.05)));
+
+    #[cfg(target_arch = "wasm32")]
+    let waiting_for_play = !playback.playing && playback.time_sec < 0.05;
+
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "native-youtube")))]
+    let waiting_for_play = false;
+
     let cues = lyric_cues();
-    let l_idx = find_cue_index(cues, t);
+    let l_idx = if waiting_for_play {
+        -2
+    } else {
+        find_cue_index(cues, t)
+    };
     let caption_changed = l_idx != state.last_caption_idx;
     if caption_changed {
         state.last_caption_idx = l_idx;
-        if l_idx < 0 {
+        if l_idx == -2 {
+            overlay_text.caption = "Click Play on the YouTube video to start.".to_string();
+            overlay_text.caption_is_meta = true;
+        } else if l_idx < 0 {
             overlay_text.caption.clear();
             overlay_text.caption_is_meta = false;
         } else {
@@ -4831,7 +4891,9 @@ fn update_overlays(
                 mcbaise_set_credit(opening_credit_html(c_idx as usize), credit_show);
             }
 
-            if l_idx < 0 {
+            if l_idx == -2 {
+                mcbaise_set_caption(&overlay_text.caption, caption_show, true);
+            } else if l_idx < 0 {
                 mcbaise_set_caption("", false, false);
             } else {
                 let cue = &cues[l_idx as usize];
@@ -4849,6 +4911,8 @@ struct UiOverlayParams<'w, 's> {
     overlay_text: Res<'w, OverlayText>,
     overlay_vis: ResMut<'w, OverlayVisibility>,
     caption_vis: ResMut<'w, CaptionVisibility>,
+    #[cfg(target_arch = "wasm32")]
+    video_vis: ResMut<'w, VideoVisibility>,
     playback: ResMut<'w, Playback>,
     settings: ResMut<'w, TubeSettings>,
     scheme_mode: ResMut<'w, ColorSchemeMode>,
@@ -4878,6 +4942,8 @@ fn ui_overlay(
         overlay_text,
         mut overlay_vis,
         mut caption_vis,
+        #[cfg(target_arch = "wasm32")]
+        mut video_vis,
         mut playback,
         mut settings,
         mut scheme_mode,
@@ -4967,9 +5033,19 @@ fn ui_overlay(
                         // Keep JS in sync immediately.
                         let t = playback.time_sec;
                         let cues = lyric_cues();
-                        let l_idx = find_cue_index(cues, t);
+                        let l_idx = if !playback.playing && playback.time_sec < 0.05 {
+                            -2
+                        } else {
+                            find_cue_index(cues, t)
+                        };
                         let caption_show = caption_vis.show;
-                        if l_idx < 0 {
+                        if l_idx == -2 {
+                            mcbaise_set_caption(
+                                "Click Play on the YouTube video to start.",
+                                caption_show,
+                                true,
+                            );
+                        } else if l_idx < 0 {
                             mcbaise_set_caption("", false, false);
                         } else {
                             let cue = &cues[l_idx as usize];
@@ -4998,8 +5074,18 @@ fn ui_overlay(
                             // Keep captions in sync immediately (credits are independent).
                             let t = playback.time_sec;
                             let cues = lyric_cues();
-                            let l_idx = find_cue_index(cues, t);
-                            if l_idx < 0 {
+                            let l_idx = if !playback.playing && playback.time_sec < 0.05 {
+                                -2
+                            } else {
+                                find_cue_index(cues, t)
+                            };
+                            if l_idx == -2 {
+                                mcbaise_set_caption(
+                                    "Click Play on the YouTube video to start.",
+                                    caption_vis.show,
+                                    true,
+                                );
+                            } else if l_idx < 0 {
                                 mcbaise_set_caption("", false, false);
                             } else {
                                 let cue = &cues[l_idx as usize];
@@ -5022,13 +5108,37 @@ fn ui_overlay(
                             // Keep JS in sync immediately.
                             let t = playback.time_sec;
                             let cues = lyric_cues();
-                            let l_idx = find_cue_index(cues, t);
-                            if l_idx < 0 {
+                            let l_idx = if !playback.playing && playback.time_sec < 0.05 {
+                                -2
+                            } else {
+                                find_cue_index(cues, t)
+                            };
+                            if l_idx == -2 {
+                                mcbaise_set_caption(
+                                    "Click Play on the YouTube video to start.",
+                                    caption_vis.show,
+                                    true,
+                                );
+                            } else if l_idx < 0 {
                                 mcbaise_set_caption("", false, false);
                             } else {
                                 let cue = &cues[l_idx as usize];
                                 mcbaise_set_caption(&cue.text, caption_vis.show, cue.is_meta);
                             }
+                        }
+                    }
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let video_toggle_label = if video_vis.show {
+                            "Hide video"
+                        } else {
+                            "Show video"
+                        };
+
+                        if ui.button(video_toggle_label).clicked() {
+                            video_vis.show = !video_vis.show;
+                            mcbaise_set_video_visible(video_vis.show);
                         }
                     }
                 });
