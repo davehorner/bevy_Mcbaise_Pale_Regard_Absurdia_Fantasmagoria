@@ -14,6 +14,24 @@ exclude = [
     "www/pkg/**",
 ]
 
+[lib]
+name = "bevy_mcbaise_fantasmagoria"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "bevy_mcbaise_fantasmagoria_native"
+path = "src/main.rs"
+
+[[bin]]
+name = "bevy_mcbaise_fantasmagoria_youtube"
+path = "src/main.rs"
+required-features = ["native-youtube"]
+
+[[bin]]
+name = "bevy_mcbaise_fantasmagoria_mpv"
+path = "src/main.rs"
+required-features = ["native-mpv"]
+
 [features]
 default = ["native"]
 native = ["bevy/multi_threaded"]

@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="icon" href="favicon.ico" sizes="any" />
   <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+  <link href="https://fonts.googleapis.com/icon?family=Material+Icons" rel="stylesheet">
   <title>MCBAISE • PALE REGARD • ABSURDIA FANTASMAGORIA</title>
   <script>
     // vizOnly iframes should never show the YouTube pane/loading UI.
@@ -428,10 +429,23 @@
     <button class="videoPi" data-dir="right" title="Add viz right">E</button>
     <button class="videoPi" data-dir="bottom" title="Add viz below">S</button>
     <button class="videoPi" data-dir="left" title="Add viz left">W</button>
+    <i id="gif-recorder-icon" class="material-icons" style="position: absolute; right: 8px; bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); color: #cccccc; font-size: 24px; pointer-events: auto; z-index: 40; transition: color 0.2s ease; cursor: pointer;">videocam</i>
+    <i id="gif-fullscreen-icon" class="material-icons" style="position: absolute; right: 40px; bottom: calc(env(safe-area-inset-bottom, 0px) + 8px); color: #cccccc; font-size: 24px; pointer-events: auto; z-index: 40; transition: color 0.2s ease; cursor: pointer; border: 2px solid white; border-radius: 50%; padding: 2px;">web</i>
   </div>
 
   <script type="module">
     const VIDEO_ID = "v2hcW03gcus";
+    const PROJECT_NAME = "bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria";
+    // Export globals for non-module scripts (recorder, debug helpers)
+    try { window.VIDEO_ID = VIDEO_ID; } catch (_) {}
+    try { window.PROJECT_NAME = PROJECT_NAME; } catch (_) {}
+    function getOutputFilename(ext) {
+      try {
+        const t = new Date().toISOString().replace(/[:.]/g, '-');
+        return `${PROJECT_NAME}-${t}.${ext}`;
+      } catch (_) { return `bevy-recording.${ext}`; }
+    }
+    try { window.getOutputFilename = getOutputFilename; } catch (_) {}
 
     const params = new URLSearchParams(window.location.search);
     const vizOnly = params.get("vizOnly") === "1";
@@ -670,6 +684,13 @@
     globalThis.mcbaise_set_wasm_ready = () => {
       wasmReady = true;
       refreshLoading();
+      // If this is a viz-only iframe, notify the parent (or transferred port) that
+      // we're ready to provide snapshots. This helps the parent avoid requesting
+      // snapshots before the canvas exists.
+      try {
+        const msg = { type: 'snapshot_ready' };
+        try { childPort?.postMessage?.(msg); } catch (_) { window.parent?.postMessage?.(msg, PAGE_ORIGIN); }
+      } catch (_) {}
     };
 
     function loadScript(src) {
@@ -795,6 +816,9 @@
     // This avoids wasm-bindgen's single-instance limitation within one document.
     // Track injected viz iframes as objects so we can retry/post-initialize reliably.
     const extraVizFrames = [];
+    // Also expose on `window` so code that runs in slightly different scopes
+    // (or debug helpers) can access the same array without throwing.
+    try { window._mcbaise_extraVizFrames = extraVizFrames; } catch (_) {}
     // Observers and policy settings for priority/backoff
     const MAX_FULL_QUALITY = 3; // keep top N frames at full quality
     let io = null; // IntersectionObserver
@@ -1465,6 +1489,45 @@
           try { window.parent?.postMessage({ type: 'mcbaise_set_video_visible_ack', applied: !!data.show }, PAGE_ORIGIN); } catch (_) {}
           return;
         }
+        // Parent may request a snapshot of the local canvas for recording.
+        if (data.type === 'request_snapshot') {
+          (async () => {
+            try {
+              const c = document.getElementById('bevy-canvas') || document.querySelector('canvas');
+              if (!c || !(c instanceof HTMLCanvasElement)) {
+                // Reply explicitly with null to indicate failure.
+                try { childPort?.postMessage?.({ type: 'snapshot', dataUrl: null }); } catch (_) { window.parent.postMessage({ type: 'snapshot', dataUrl: null }, PAGE_ORIGIN); }
+                return;
+              }
+              // Try toDataURL first
+              try {
+                const d = c.toDataURL('image/png');
+                try { childPort?.postMessage?.({ type: 'snapshot', dataUrl: d }); } catch (_) { window.parent.postMessage({ type: 'snapshot', dataUrl: d }, PAGE_ORIGIN); }
+                return;
+              } catch (_) {}
+              // Fallback: draw to an offscreen canvas after createImageBitmap
+              try {
+                if (typeof createImageBitmap === 'function') {
+                  const bm = await createImageBitmap(c);
+                  const oc = document.createElement('canvas');
+                  oc.width = bm.width; oc.height = bm.height;
+                  const octx = oc.getContext('2d', { willReadFrequently: true });
+                  octx.drawImage(bm, 0, 0);
+                  try { bm.close?.(); } catch (_) {}
+                  const d2 = oc.toDataURL('image/png');
+                  try { childPort?.postMessage?.({ type: 'snapshot', dataUrl: d2 }); } catch (_) { window.parent.postMessage({ type: 'snapshot', dataUrl: d2 }, PAGE_ORIGIN); }
+                  return;
+                }
+              } catch (e) {
+                console.debug('child snapshot fallback failed', e);
+              }
+              try { childPort?.postMessage?.({ type: 'snapshot', dataUrl: null }); } catch (_) { window.parent.postMessage({ type: 'snapshot', dataUrl: null }, PAGE_ORIGIN); }
+            } catch (_) {
+              try { childPort?.postMessage?.({ type: 'snapshot', dataUrl: null }); } catch (_) { window.parent.postMessage({ type: 'snapshot', dataUrl: null }, PAGE_ORIGIN); }
+            }
+          })();
+          return;
+        }
         if (data.type === 'mcbaise_request_playing') {
           try {
             if (data.playing) wasm?.request_playing?.(true);
@@ -1633,6 +1696,13 @@
                           // Send the computed offset to the child so it can correct locally.
                           try { frameObj.port.postMessage({ type: 'clock_offset', offset_ms: offset }); } catch (_) {}
                           console.debug('mcbaise:ping', { rtt, offset, frame: frameObj });
+                        } else if (d && d.type === 'snapshot_ready') {
+                          frameObj._snapshotReady = true;
+                          console.debug('mcbaise:port:snapshot_ready', { frame: frameObj });
+                        } else if (d && d.type === 'snapshot') {
+                          // forward snapshot to any listeners by emitting a custom event
+                          try { frameObj._lastSnapshot = d.dataUrl || null; frameObj._failCount = 0; } catch (_) {}
+                          console.debug('mcbaise:port:snapshot', { len: (d.dataUrl || '').length });
                         } else {
                           // child -> parent messages on the port if needed
                           console.debug('mcbaise:port:message', ev.data);
@@ -1714,6 +1784,537 @@
     }
 
     main().catch(err => console.error(err));
+  </script>
+  <script src="gif.js"></script>
+  <script>
+    let isRecording = false;
+    let isFullscreenRecording = false;
+    let frames = [];
+    let recordInterval;
+    // Keep last-good snapshots so we can reuse them when a tick returns a black/placeholder frame.
+    let lastGoodSingleDataUrl = null;
+    let lastGoodCompositeDataUrl = null;
+
+    console.log('GIF script loaded, attaching event listener');
+    const gifIcon = document.getElementById('gif-recorder-icon');
+    const fullscreenIcon = document.getElementById('gif-fullscreen-icon');
+
+    gifIcon.addEventListener('click', function() {
+      if (isFullscreenRecording) return; // Don't allow both recordings
+      if (!isRecording) {
+        // Start recording
+        isRecording = true;
+        frames = [];
+        gifIcon.textContent = 'stop';
+        gifIcon.style.color = '#00ff00'; // Green when recording
+        recordInterval = setInterval(async () => {
+          const canvas = document.getElementById('bevy-canvas');
+          if (canvas) {
+            try {
+              const dataURL = canvas.toDataURL('image/png');
+              if (dataURL && dataURL.length > 200) {
+                frames.push(dataURL);
+                lastGoodSingleDataUrl = dataURL;
+              } else if (lastGoodSingleDataUrl) {
+                frames.push(lastGoodSingleDataUrl);
+                console.debug('mcbaise:record:using-last-good-single-frame');
+              } else {
+                console.debug('mcbaise:record:skipping tiny single-canvas frame', { len: (dataURL || '').length });
+              }
+            } catch (e) {
+              if (lastGoodSingleDataUrl) {
+                frames.push(lastGoodSingleDataUrl);
+                console.debug('mcbaise:record:single toDataURL failed - using last good', e);
+              } else {
+                console.debug('mcbaise:record:single-canvas toDataURL failed', e);
+              }
+            }
+          }
+        }, 100); // Capture every 100ms
+      } else {
+        // Stop recording and create GIF
+        isRecording = false;
+        clearInterval(recordInterval);
+        gifIcon.textContent = 'videocam';
+        gifIcon.style.color = '#cccccc'; // Back to light grey
+        if (frames.length > 0) {
+          createGIF(frames);
+        }
+      }
+    });
+
+    fullscreenIcon.addEventListener('click', function() {
+      if (isRecording) return; // Don't allow both recordings
+      if (!isFullscreenRecording) {
+        // Start fullscreen recording
+        isFullscreenRecording = true;
+        frames = [];
+        fullscreenIcon.textContent = 'stop';
+        fullscreenIcon.style.color = '#00ff00'; // Green when recording
+        recordInterval = setInterval(async () => {
+          try {
+            // Use page dimensions so we can place multiple canvases by absolute page position.
+            const pageRect = document.documentElement.getBoundingClientRect();
+            const totalWidth = Math.max(1, Math.ceil(pageRect.width));
+            const totalHeight = Math.max(1, Math.ceil(pageRect.height));
+
+            const composite = document.createElement('canvas');
+            composite.width = totalWidth;
+            composite.height = totalHeight;
+            const ctx = composite.getContext('2d', { willReadFrequently: true });
+            // Black background
+            ctx.fillStyle = '#000000';
+            ctx.fillRect(0, 0, composite.width, composite.height);
+
+            // Left column layout: draw placeholder only in the actual player area(s)
+            const leftElement = document.getElementById('left');
+            const playerWrap = document.getElementById('playerWrap');
+            const leftExtras = leftElement ? Array.from(leftElement.querySelectorAll('.extraViz, #playerWrap')) : [];
+            ctx.fillStyle = '#ffffff';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            const fontSize = Math.max(12, Math.round(Math.min(32, totalHeight * 0.06)));
+            ctx.font = `${fontSize}px sans-serif`;
+            const videoTitle = (typeof player !== 'undefined' && player && typeof player.getVideoData === 'function') ? (player.getVideoData().title || '') : '';
+            const leftLines = [PROJECT_NAME, `YOUTUBE ${window.VIDEO_ID}${videoTitle ? ' - ' + videoTitle : ''}`];
+            const lineH = fontSize * 1.15;
+
+            if (playerWrap) {
+              try {
+                const pRect = playerWrap.getBoundingClientRect();
+                ctx.fillStyle = '#111111';
+                ctx.fillRect(Math.round(pRect.left), Math.round(pRect.top), Math.round(pRect.width), Math.round(pRect.height));
+                const startY = pRect.top + pRect.height / 2 - (leftLines.length - 1) * lineH / 2;
+                for (let i = 0; i < leftLines.length; i++) {
+                  ctx.fillStyle = '#ffffff';
+                  ctx.fillText(leftLines[i], Math.round(pRect.left + pRect.width / 2), Math.round(startY + i * lineH));
+                }
+              } catch (_) {}
+            }
+
+            // If there are extra viz panes in the left column, draw smaller placeholders
+            // only when an iframe has repeatedly failed to provide a real snapshot.
+            let _drewExtraVizPlaceholder = false;
+            try {
+              const extras = leftElement ? leftElement.querySelectorAll('.extraViz') : null;
+              if (extras && extras.length) {
+                extras.forEach(ex => {
+                  try {
+                    const er = ex.getBoundingClientRect();
+                    const iframe = ex.querySelector && ex.querySelector('iframe');
+                    const framesList = (typeof extraVizFrames !== 'undefined' && Array.isArray(extraVizFrames))
+                      ? extraVizFrames
+                      : (Array.isArray(window._mcbaise_extraVizFrames) ? window._mcbaise_extraVizFrames : []);
+                    let frameObj = null;
+                    try {
+                      if (iframe) frameObj = framesList.find(f => f.iframe === iframe) || framesList.find(f => f.iframe && f.iframe.contentWindow === iframe.contentWindow) || framesList.find(f => f.iframe && f.iframe.src === iframe.src) || null;
+                    } catch (_) { frameObj = null; }
+                    const failCount = (frameObj && frameObj._failCount) || 0;
+                    const hasSnapshot = !!(frameObj && frameObj._lastSnapshot);
+                    // If we have a recent snapshot or haven't failed enough times, skip the placeholder.
+                    if (hasSnapshot || failCount < 3) return;
+                    ctx.fillStyle = '#0b0b0b';
+                    ctx.fillRect(Math.round(er.left), Math.round(er.top), Math.round(er.width), Math.round(er.height));
+                    ctx.fillStyle = '#ffffff';
+                    ctx.fillText('EXTRA VIZ (no snapshot)', Math.round(er.left + er.width / 2), Math.round(er.top + er.height / 2));
+                    _drewExtraVizPlaceholder = true;
+                  } catch (_) {}
+                });
+              }
+            } catch (_) {}
+
+            // Collect capture targets (canvases) and their page rects.
+            const targets = [];
+
+            // Prefer explicit `#bevy-canvas` in this document
+            const bevyCanvas = document.getElementById('bevy-canvas');
+            if (bevyCanvas instanceof HTMLCanvasElement) {
+              targets.push({ canvas: bevyCanvas, rect: bevyCanvas.getBoundingClientRect(), fromIframe: false });
+            }
+
+            // Any canvases inside the right pane
+            const rightElement = document.getElementById('right');
+            if (rightElement) {
+              const canvases = rightElement.querySelectorAll('canvas');
+              canvases.forEach(c => { if (c instanceof HTMLCanvasElement && c !== bevyCanvas) targets.push({ canvas: c, rect: c.getBoundingClientRect(), fromIframe: false }); });
+            }
+
+            // Attempt to capture canvases inside same-origin `.extraViz` iframes.
+            const extraIframes = document.querySelectorAll('.extraViz iframe');
+            // Helper: request a dataURL snapshot from an iframe via MessagePort or postMessage.
+            async function requestIframeSnapshot(iframe) {
+              try {
+                // Prefer our tracked `extraVizFrames` which may hold a MessagePort.
+                // Guard against ReferenceError when `extraVizFrames` isn't in this scope
+                // (use typeof checks and fall back to window-exposed array).
+                const framesList = (typeof extraVizFrames !== 'undefined' && Array.isArray(extraVizFrames))
+                  ? extraVizFrames
+                  : (Array.isArray(window._mcbaise_extraVizFrames) ? window._mcbaise_extraVizFrames : (Array.isArray(window.extraVizFrames) ? window.extraVizFrames : []));
+                let frameObj = framesList.find(f => f.iframe === iframe) || null;
+                // If the exact iframe object wasn't matched (e.g. different but same src), try matching by contentWindow or src
+                if (!frameObj) {
+                  try {
+                    frameObj = framesList.find(f => f.iframe && f.iframe.contentWindow === iframe.contentWindow) || frameObj;
+                  } catch (_) {}
+                  try {
+                    const src = iframe && iframe.src;
+                    if (!frameObj && src) frameObj = framesList.find(f => f.iframe && f.iframe.src === src) || null;
+                  } catch (_) {}
+                }
+                // If a MessagePort is available, request snapshot through it. If not yet attached, wait briefly for it.
+                if (frameObj) {
+                  // wait up to 700ms for port readiness
+                  const start = performance.now();
+                  while ((!frameObj.port || typeof frameObj.port.postMessage !== 'function') && (performance.now() - start) < 700) {
+                    await new Promise(r => setTimeout(r, 60));
+                  }
+                  if (frameObj.port && typeof frameObj.port.postMessage === 'function') {
+                    try {
+                      return await new Promise((resolve) => {
+                        let resolved = false;
+                        const onmsg = (ev) => {
+                          try {
+                            const d = ev.data;
+                            if (d && d.type === 'snapshot') {
+                              if (!resolved) { resolved = true; try { frameObj.port.removeEventListener('message', onmsg); } catch (_) {} resolve(d.dataUrl || null); }
+                            }
+                          } catch (_) {}
+                        };
+                        try { frameObj.port.addEventListener('message', onmsg); } catch (_) {}
+                        try { frameObj.port.postMessage({ type: 'request_snapshot' }); } catch (_) {}
+                        setTimeout(() => { if (!resolved) { resolved = true; try { frameObj.port.removeEventListener('message', onmsg); } catch (_) {} resolve(null); } }, 800);
+                      });
+                    } catch (e) { if (window.__MCBAISE_DEBUG) console.debug('port snapshot request failed', e); }
+                  }
+                }
+
+                // Fallback: if same-origin, postMessage to contentWindow and wait for a reply
+                try {
+                  const win = iframe.contentWindow;
+                  if (win && iframe.contentDocument) {
+                    try {
+                      return await new Promise((resolve) => {
+                        let resolved = false;
+                        const onmsg = (ev) => {
+                          try {
+                            if (ev.source === win && ev.data && ev.data.type === 'snapshot') {
+                              if (!resolved) { resolved = true; window.removeEventListener('message', onmsg); resolve(ev.data.dataUrl || null); }
+                            }
+                          } catch (_) {}
+                        };
+                        window.addEventListener('message', onmsg);
+                        try { win.postMessage({ type: 'request_snapshot' }, PAGE_ORIGIN); } catch (e) { try { win.postMessage({ type: 'request_snapshot' }, '*'); } catch (_) {} }
+                        setTimeout(() => { if (!resolved) { resolved = true; window.removeEventListener('message', onmsg); resolve(null); } }, 800);
+                      });
+                    } catch (e) { if (window.__MCBAISE_DEBUG) console.debug('iframe postMessage request failed', e); }
+                  }
+                } catch (e) {
+                  if (window.__MCBAISE_DEBUG) console.debug('iframe snapshot postMessage failed', e);
+                }
+              } catch (e) {
+                if (window.__MCBAISE_DEBUG) console.debug('requestIframeSnapshot error', e);
+              }
+              // If we have a tracked frame object, increment a failure counter so
+              // the UI can decide whether to render a placeholder caption.
+              try { if (frameObj) frameObj._failCount = (frameObj._failCount || 0) + 1; } catch (_) {}
+              return null;
+            }
+
+            for (const iframe of extraIframes) {
+              try {
+                const iframeRect = iframe.getBoundingClientRect();
+                // Try to request a snapshot via port/postMessage first.
+                const dataUrl = await requestIframeSnapshot(iframe);
+                if (dataUrl) {
+                  try {
+                    const img = new Image();
+                    await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = dataUrl; });
+                    targets.push({ img, rect: iframeRect, fromIframe: true, isImage: true });
+                    continue;
+                  } catch (e) {
+                    if (window.__MCBAISE_DEBUG) console.debug('failed to load snapshot image', e);
+                  }
+                }
+                // If snapshot failed, try same-origin direct access as a last resort
+                try {
+                  const doc = iframe.contentDocument || (iframe.contentWindow && iframe.contentWindow.document);
+                  if (!doc) continue;
+                  const innerCanvas = doc.getElementById('bevy-canvas') || doc.querySelector('canvas');
+                  if (innerCanvas && innerCanvas instanceof HTMLCanvasElement) {
+                    targets.push({ canvas: innerCanvas, rect: iframeRect, fromIframe: true });
+                  }
+                } catch (e) {
+                  if (window.__MCBAISE_DEBUG) console.debug('skip iframe canvas capture', e);
+                }
+              } catch (e) {
+                if (window.__MCBAISE_DEBUG) console.debug('extra iframe handling failed', e);
+              }
+            }
+
+            // Draw all targets into the composite at their page positions.
+            for (const t of targets) {
+              try {
+                const r = t.rect;
+                // If this target is an image (snapshot from iframe), draw it directly.
+                if (t.isImage && t.img) {
+                  try {
+                    ctx.drawImage(t.img, 0, 0, t.img.width || Math.round(r.width), t.img.height || Math.round(r.height), Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
+                    console.debug('mcbaise:record:target:image', { fromIframe: !!t.fromIframe, rect: r, imgWidth: t.img.width, imgHeight: t.img.height });
+                    continue;
+                  } catch (e) {
+                    if (window.__MCBAISE_DEBUG) console.debug('drawImage(snapshot) failed', e);
+                  }
+                }
+                // Debug: attempt a `toDataURL` to detect tainting / read errors on canvas targets.
+                let toDataUrlOk = false;
+                try {
+                  const _d = t.canvas.toDataURL('image/png');
+                  toDataUrlOk = !!(_d && _d.length > 100);
+                } catch (e) {
+                  if (window.__MCBAISE_DEBUG) console.debug('toDataURL failed for target canvas', e);
+                  toDataUrlOk = false;
+                }
+                console.debug('mcbaise:record:target', { fromIframe: !!t.fromIframe, toDataUrlOk, canvasWidth: t.canvas?.width, canvasHeight: t.canvas?.height, rect: r });
+                // Use explicit source size to avoid implicit CSS->bitmap scaling issues.
+                const srcW = (t.canvas && t.canvas.width) || Math.round(r.width);
+                const srcH = (t.canvas && t.canvas.height) || Math.round(r.height);
+                // If toDataURL failed or canvas is WebGL without preserved buffer, try ImageBitmap fallback
+                // then a captureStream+ImageCapture grabFrame fallback. If all fail, fall back to direct draw (may be black).
+                let drawn = false;
+                try {
+                  if (toDataUrlOk) {
+                    try {
+                      // Prefer drawing a decoded image from the canvas dataURL — mirrors single-canvas capture flow.
+                      const durl = t.canvas.toDataURL('image/png');
+                      const img = new Image();
+                      await new Promise((res, rej) => { img.onload = res; img.onerror = rej; img.src = durl; });
+                      ctx.drawImage(img, 0, 0, img.naturalWidth || srcW, img.naturalHeight || srcH, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
+                      drawn = true;
+                    } catch (e) {
+                      if (window.__MCBAISE_DEBUG) console.debug('draw from dataURL failed, falling back to canvas draw', e);
+                      try { ctx.drawImage(t.canvas, 0, 0, srcW, srcH, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)); drawn = true; } catch (_) {}
+                    }
+                  } else {
+                    if (typeof createImageBitmap === 'function') {
+                      try {
+                        const bitmap = await createImageBitmap(t.canvas);
+                        ctx.drawImage(bitmap, 0, 0, bitmap.width, bitmap.height, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
+                        try { bitmap.close?.(); } catch (_) {}
+                        drawn = true;
+                      } catch (e) {
+                        if (window.__MCBAISE_DEBUG) console.debug('createImageBitmap failed', e);
+                      }
+                    }
+
+                    // Try canvas.captureStream -> ImageCapture.grabFrame as a fallback (some browsers provide compositor frames)
+                    if (!drawn && typeof t.canvas.captureStream === 'function' && typeof window.ImageCapture === 'function') {
+                      try {
+                        const stream = t.canvas.captureStream();
+                        const track = (stream && stream.getVideoTracks && stream.getVideoTracks()[0]);
+                        if (track) {
+                          try {
+                            const ic = new ImageCapture(track);
+                            const frameBitmap = await ic.grabFrame();
+                            try {
+                              ctx.drawImage(frameBitmap, 0, 0, frameBitmap.width, frameBitmap.height, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
+                              drawn = true;
+                            } finally {
+                              try { frameBitmap.close?.(); } catch (_) {}
+                            }
+                          } catch (e) {
+                            if (window.__MCBAISE_DEBUG) console.debug('ImageCapture.grabFrame failed', e);
+                          } finally {
+                            try { track.stop(); } catch (_) {}
+                          }
+                        }
+                      } catch (e) {
+                        if (window.__MCBAISE_DEBUG) console.debug('captureStream fallback failed', e);
+                      }
+                    }
+
+                    if (!drawn) {
+                      // Last resort: try direct draw (may be black for non-preserved WebGL canvases)
+                      try {
+                        ctx.drawImage(t.canvas, 0, 0, srcW, srcH, Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height));
+                        drawn = true;
+                      } catch (e) {
+                        if (window.__MCBAISE_DEBUG) console.debug('direct drawImage fallback failed', e);
+                      }
+                    }
+                  }
+                } catch (e) {
+                  if (window.__MCBAISE_DEBUG) console.debug('capture drawing flow error', e);
+                }
+              } catch (e) {
+                console.error('drawImage(target) failed', e);
+              }
+            }
+
+            // Expose a debug list so devs can inspect what's being captured.
+            try { window._mcbaise_record_targets = targets.map(t => ({ rect: t.rect, fromIframe: !!t.fromIframe })); } catch (_) {}
+
+            try {
+              const dataUrl = composite.toDataURL('image/png');
+              const len = dataUrl ? dataUrl.length : 0;
+              console.debug('mcbaise:record:frame', { len, targets: (window._mcbaise_record_targets || []).length, drewPlaceholder: !!_drewExtraVizPlaceholder });
+              // If we drew an EXTRA VIZ placeholder because a child didn't provide
+              // a snapshot, prefer to reuse the last-good composite frame so the
+              // output remains visually continuous. If no last-good exists, skip.
+              if (_drewExtraVizPlaceholder) {
+                if (lastGoodCompositeDataUrl) {
+                  frames.push(lastGoodCompositeDataUrl);
+                  console.warn('mcbaise:record:using-last-good-composite-due-to-placeholder', { len });
+                } else {
+                  console.warn('mcbaise:record:skipping frame due to extra-viz placeholder', { len });
+                }
+              } else if (len > 200) {
+                frames.push(dataUrl);
+                lastGoodCompositeDataUrl = dataUrl;
+              } else {
+                if (lastGoodCompositeDataUrl) {
+                  frames.push(lastGoodCompositeDataUrl);
+                  console.warn('mcbaise:record:using-last-good-composite-due-to-tiny-frame', { len });
+                } else {
+                  console.warn('mcbaise:record:skipping tiny/empty frame', { len });
+                }
+              }
+            } catch (e) {
+              console.error('mcbaise:record:toDataURL failed', e);
+            }
+          } catch (err) {
+            console.error('Fullscreen capture tick failed', err);
+          }
+        }, 200); // Capture every 200ms
+      } else {
+        // Stop recording and create GIF
+        isFullscreenRecording = false;
+        clearInterval(recordInterval);
+        fullscreenIcon.textContent = 'web';
+        fullscreenIcon.style.color = '#cccccc'; // Back to light grey
+        if (frames.length > 0) createGIF(frames);
+      }
+    });
+
+    function createGIF(frameDataURLs) {
+      // Helper: fallback to WebM by replaying frames onto a canvas and recording via MediaRecorder
+      function createWebMFromFrames(urls, fps = 10) {
+        return new Promise(async (resolve, reject) => {
+          try {
+            if (!urls || !urls.length) return reject(new Error('no frames'));
+            // Load all images
+            const imgs = await Promise.all(urls.map(u => new Promise((res, rej) => {
+              const im = new Image();
+              im.onload = () => res(im);
+              im.onerror = rej;
+              im.src = u;
+            })));
+
+            const w = imgs[0].naturalWidth || imgs[0].width || 640;
+            const h = imgs[0].naturalHeight || imgs[0].height || 480;
+            const oc = document.createElement('canvas');
+            oc.width = w; oc.height = h;
+            const octx = oc.getContext('2d', { willReadFrequently: true });
+
+            const stream = oc.captureStream(Math.max(1, fps));
+            const recorder = new MediaRecorder(stream, { mimeType: 'video/webm;codecs=vp9' });
+            const chunks = [];
+            recorder.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+            recorder.onstop = () => {
+              const blob = new Blob(chunks, { type: 'video/webm' });
+              resolve(blob);
+            };
+
+            recorder.start();
+            // Playback loop
+            let idx = 0;
+            const interval = Math.round(1000 / fps);
+            const id = setInterval(() => {
+              try {
+                const im = imgs[idx % imgs.length];
+                octx.clearRect(0, 0, w, h);
+                octx.drawImage(im, 0, 0, w, h);
+                idx++;
+                if (idx >= imgs.length) {
+                  clearInterval(id);
+                  setTimeout(() => {
+                    try { recorder.stop(); } catch (_) { }
+                  }, 50);
+                }
+              } catch (e) { clearInterval(id); try { recorder.stop(); } catch (_) {} reject(e); }
+            }, interval);
+          } catch (e) { reject(e); }
+        });
+      }
+
+      if (!frameDataURLs || frameDataURLs.length === 0) return;
+
+      // If only one frame or gif.js is unreliable, prefer WebM fallback for reliability.
+      if (frameDataURLs.length < 2) {
+        createWebMFromFrames(frameDataURLs, 10).then(blob => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = getOutputFilename('webm');
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }).catch(e => console.error('webm fallback failed', e));
+        return;
+      }
+
+      // Otherwise attempt GIF but fall back to WebM if GIF rendering fails or stalls.
+      const gif = new GIF({ workers: 2, quality: 10, workerScript: 'gif.worker.js' });
+      const imgs = [];
+      let loaded = 0;
+      let didFinish = false;
+
+      const failover = () => {
+        if (didFinish) return;
+        didFinish = true;
+        console.warn('gif: falling back to webm');
+        createWebMFromFrames(frameDataURLs, 10).then(blob => {
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = getOutputFilename('webm');
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        }).catch(e => console.error('webm fallback failed', e));
+      };
+
+      // Timeout to trigger fallback if GIF.render doesn't finish in a reasonable time
+      const fallbackTimer = setTimeout(failover, 15000);
+
+      frameDataURLs.forEach(dataURL => {
+        const img = new Image();
+        img.onload = function() {
+          if (didFinish) return;
+          gif.addFrame(img, { delay: 100 });
+          loaded++;
+          if (loaded === frameDataURLs.length) {
+            gif.on('finished', function(blob) {
+              if (didFinish) return;
+              didFinish = true;
+              clearTimeout(fallbackTimer);
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = getOutputFilename('gif');
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              URL.revokeObjectURL(url);
+            });
+            try { gif.render(); } catch (e) { console.error('gif.render failed', e); failover(); }
+          }
+        };
+        img.onerror = function() { console.warn('failed to load frame image'); };
+        img.src = dataURL;
+      });
+    }
   </script>
 </body>
 </html>

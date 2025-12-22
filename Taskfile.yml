@@ -37,18 +37,18 @@ tasks:
   mcbaise:native:
     desc: Run the tube ride demo natively
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}}
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native
 
   mcbaise:assets:preflight:
     desc: Test native asset auto-download (downloads/extracts if needed, prints paths, exits)
     env:
       MCBAISE_ASSETS_PREFLIGHT: "1"
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}}
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native
   mcbaise:assets:self-test:
     desc: Cross-platform Rust self-test for asset download (forces download, verifies files, restores local assets)
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}} -- --assets-self-test
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native -- --assets-self-test
 
   mcbaise:native:youtube:
     desc: Alias for mcbaise:native:youtube:fresh
@@ -62,7 +62,7 @@ tasks:
       MCBAISE_LAUNCH_WEBDRIVER: "1"
       MCBAISE_CHROME_COOKIES_TXT: '{{default "" .CHROME_COOKIES_TXT}}'
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}} --features native-youtube
+      - cargo run --bin bevy_mcbaise_fantasmagoria_youtube --features native-youtube
 
   mcbaise:native:youtube:default-profile:
     desc: Run native tube ride + YouTube sync using your default Chrome profile (logged-in cookies)
@@ -73,7 +73,7 @@ tasks:
       MCBAISE_CHROME_PROFILE_DIR: Default
       MCBAISE_CHROME_COOKIES_TXT: '{{default "" .CHROME_COOKIES_TXT}}'
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}} --features native-youtube
+      - cargo run --bin bevy_mcbaise_fantasmagoria_youtube --features native-youtube
 
   mcbaise:native:mpv:
     desc: Run native tube ride + sync playback from mpv (YouTube via yt-dlp)
@@ -86,7 +86,7 @@ tasks:
       MCBAISE_MPV_COOKIES_FROM_BROWSER: '{{default "" .MPV_COOKIES_FROM_BROWSER}}'
       MCBAISE_MPV_YTDL_RAW_OPTIONS: '{{default "" .MPV_YTDL_RAW_OPTIONS}}'
     cmds:
-      - cargo run -p {{.MCBAISE_CRATE}} --features native-mpv
+      - cargo run --bin bevy_mcbaise_fantasmagoria_mpv --features native-mpv
 
   mcbaise:wasm:toolchain:
     desc: Ensure Rust wasm target is installed
@@ -175,6 +175,7 @@ tasks:
   mcbaise:wasm:serve:
     desc: Serve the repo root so /assets is available, then open the web demo URL manually
     deps:
+      - task: naga:validate
       - task: mcbaise:wasm:build
     cmds:
       - |
@@ -323,3 +324,65 @@ tasks:
             task update-chromedriver:windows:choco
             ;;
         esac
+  naga:detect:
+    desc: Detect if `naga` (naga-cli) is available on PATH
+    cmds:
+      - |
+        if command -v naga >/dev/null 2>&1; then
+          echo "naga found: $(naga --version 2>/dev/null || echo unknown)"
+          exit 0
+        fi
+        if [ -f "${HOME}/.cargo/bin/naga" ] || [ -f "${USERPROFILE}\\.cargo\\bin\\naga.exe" ]; then
+          echo "naga found in cargo bin"
+          exit 0
+        fi
+        echo "naga not found"
+        exit 1
+
+  naga:install:posix:
+    desc: Install `naga-cli` via `cargo` on POSIX systems
+    cmds:
+      - |
+        set -euo pipefail
+        echo "Installing naga-cli via cargo..."
+        cargo install naga-cli || cargo install --locked naga-cli || true
+
+  naga:install:windows:
+    desc: Install `naga-cli` on Windows (PowerShell)
+    cmds:
+      - 'echo Installing naga-cli via cargo on Windows'
+      - 'cargo install naga-cli || cargo install --locked naga-cli || echo cargo install failed'
+
+  naga:install:
+    desc: Cross-platform installer for naga-cli
+    cmds:
+      - |-
+        set -euo pipefail
+        OS=$(uname -s 2>/dev/null || echo "Windows")
+        case "$OS" in
+          Darwin*|Linux*|*BSD*) task naga:install:posix ;;
+          *) task naga:install:windows ;;
+        esac
+
+  naga:validate:
+    desc: Validate a WGSL shader file with naga-cli (usage task naga:validate -- file=path)
+    vars:
+      file: 'crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria/src/mcbaise_tube.wgsl'
+    cmds:
+      - |-
+        if [ -z "{{.file}}" ]; then
+          echo "No file specified. Usage: task naga:validate -- file=path/to/shader.wgsl"; exit 2
+        fi
+        if ! command -v naga >/dev/null 2>&1; then
+          echo "naga not found; attempting install"; task naga:install
+        fi
+        echo "Preprocessing {{.file}} for validator (stripping host directives)..."
+        if command -v mktemp >/dev/null 2>&1 && command -v sed >/dev/null 2>&1; then
+          TMPFILE=$(mktemp 2>/dev/null || echo "${TMPDIR:-/tmp}/mcbaise_naga_pre.wgsl")
+          sed '/^[[:space:]]*#import/d; s/#{[^}]*}/0/g' "{{.file}}" > "$TMPFILE"
+          echo "Validating preprocessed shader: $TMPFILE"
+          naga "$TMPFILE" --input-kind wgsl || true
+          rm -f "$TMPFILE"
+        else
+          python tool/scripts/validate_wgsl.py "{{.file}}"
+        fi

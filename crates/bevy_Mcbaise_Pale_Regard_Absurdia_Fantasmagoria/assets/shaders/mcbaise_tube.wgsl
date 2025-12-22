@@ -5,6 +5,12 @@
 // [params0, params1, orange, white, dark_inside, dark_outside]
 @group(#{MATERIAL_BIND_GROUP}) @binding(0) var<uniform> u: array<vec4<f32>, 6>;
 
+// Fluid simulation textures
+@group(#{MATERIAL_BIND_GROUP}) @binding(1) var fluid_velocity_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(2) var fluid_velocity_sampler: sampler;
+@group(#{MATERIAL_BIND_GROUP}) @binding(3) var fluid_density_texture: texture_2d<f32>;
+@group(#{MATERIAL_BIND_GROUP}) @binding(4) var fluid_density_sampler: sampler;
+
 const TAU: f32 = 6.28318530718;
 
 fn aa_band(phase: f32, aa_mul: f32) -> f32 {
@@ -37,22 +43,35 @@ fn fragment(mesh: VertexOutput, @builtin(front_facing) is_front: bool) -> @locat
 
     let s_warp = pow(s, 1.18);
 
+    // Sample fluid textures
+    let fluid_uv = vec2<f32>(mesh.uv.x, mesh.uv.y);
+    let fluid_velocity = textureSample(fluid_velocity_texture, fluid_velocity_sampler, fluid_uv).xy;
+    let fluid_density = textureSample(fluid_density_texture, fluid_density_sampler, fluid_uv).x;
+
+    // Use fluid data to modulate the animation
+    let fluid_flow_influence = fluid_velocity.x * 0.5;
+    let fluid_density_influence = fluid_density * 0.3;
+
     // pattern 0: swirl (codepen)
     // pattern 1: stripes (simple variant)
     var phase: f32;
     if (pattern < 0.5) {
-        let theta = ang + time * spin + s_warp * TAU * turns;
-        phase = theta * bands + time * flow;
+        let theta = ang + time * spin + s_warp * TAU * turns + fluid_flow_influence * TAU;
+        phase = theta * bands + time * flow + fluid_density_influence * 2.0;
     } else {
         // stripes: fewer turns, more axial flow
-        let theta = ang + s_warp * TAU * 16.0;
-        phase = theta * (bands * 0.75) + time * (flow * 3.0);
+        let theta = ang + s_warp * TAU * 16.0 + fluid_flow_influence * TAU * 4.0;
+        phase = theta * (bands * 0.75) + time * (flow * 3.0) + fluid_density_influence * 4.0;
     }
 
     let band = aa_band(phase, aa);
 
     let t = smoothstep(white_bias, 1.0, band);
     var col = mix(white.rgb, orange.rgb, t);
+
+    // Modulate color with fluid density
+    let fluid_color_mod = mix(vec3<f32>(0.8, 0.9, 1.0), vec3<f32>(1.0, 0.8, 0.9), fluid_density);
+    col = col * fluid_color_mod;
 
     let depth = smoothstep(0.0, 1.0, s);
     let dark = select(dark_inside.rgb, dark_outside.rgb, is_front);
