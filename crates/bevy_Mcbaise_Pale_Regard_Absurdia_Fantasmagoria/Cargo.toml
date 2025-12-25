@@ -34,7 +34,8 @@ required-features = ["native-mpv"]
 
 [features]
 default = ["native"]
-native = ["bevy/multi_threaded", "capture_ui"]
+native = ["bevy/multi_threaded"]
+burn_human = ["bevy_burn_human"]
 native-youtube = ["dep:fantoccini", "dep:tokio", "dep:serde_json", "dep:url", "dep:time"]
 native-mpv = ["dep:tokio", "dep:serde_json"]
 capture_ui = []
@@ -68,11 +69,13 @@ bevy = { version = "0.17", default-features = false, features = [
     "zstd_rust",
 ] }
 bevy_egui = "0.38"
-bevy_burn_human = "0.2"
+bevy_burn_human = { version = "0.2", optional = true }
 fastrand = "2"
 
 # Used by wasm GPU readback (texture -> buffer copy + mapping).
 wgpu = "26"
+pollster = "0.4.0"
+crossbeam-channel = "0.5.15"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 console_error_panic_hook = "0.1"

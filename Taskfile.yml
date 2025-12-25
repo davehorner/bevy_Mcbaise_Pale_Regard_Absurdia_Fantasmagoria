@@ -39,6 +39,12 @@ tasks:
     cmds:
       - cargo run --bin bevy_mcbaise_fantasmagoria_native
 
+  # mcbaise native + human variants
+  mcbaise:native:human:
+    desc: Run the tube ride demo natively with `burn_human` feature enabled
+    cmds:
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native --features burn_human
+
   mcbaise:assets:preflight:
     desc: Test native asset auto-download (downloads/extracts if needed, prints paths, exits)
     env:
@@ -64,6 +70,15 @@ tasks:
     cmds:
       - cargo run --bin bevy_mcbaise_fantasmagoria_youtube --features native-youtube
 
+  mcbaise:native:youtube:human:
+    desc: Run native tube ride + YouTube sync with `burn_human` feature
+    env:
+      MCBAISE_NATIVE_YOUTUBE: "1"
+      MCBAISE_LAUNCH_WEBDRIVER: "1"
+      MCBAISE_CHROME_COOKIES_TXT: '{{default "" .CHROME_COOKIES_TXT}}'
+    cmds:
+      - cargo run --bin bevy_mcbaise_fantasmagoria_youtube --features native-youtube,burn_human
+
   mcbaise:native:youtube:default-profile:
     desc: Run native tube ride + YouTube sync using your default Chrome profile (logged-in cookies)
     env:
@@ -84,6 +99,15 @@ tasks:
     cmds:
       - cargo run --bin bevy_mcbaise_fantasmagoria_native
 
+  mcbaise:native:trace:human:
+    desc: Run the native demo with `burn_human` enabled and verbose tracing
+    env:
+      RUST_LOG: 'debug'
+      BEVY_BACKTRACE: 'full'
+      WGPU_ERROR_MODE: 'nonfatal'
+    cmds:
+      - cargo run --bin bevy_mcbaise_fantasmagoria_native --features burn_human
+
   mcbaise:native:mpv:
     desc: Run native tube ride + sync playback from mpv (YouTube via yt-dlp)
     env:
@@ -96,6 +120,19 @@ tasks:
       MCBAISE_MPV_YTDL_RAW_OPTIONS: '{{default "" .MPV_YTDL_RAW_OPTIONS}}'
     cmds:
       - cargo run --bin bevy_mcbaise_fantasmagoria_mpv --features native-mpv
+
+  mcbaise:native:mpv:human:
+    desc: Run native tube ride + mpv sync with `burn_human` feature
+    env:
+      MCBAISE_NATIVE_MPV: "1"
+      MCBAISE_MPV_URL: '{{default "" .MPV_URL}}'
+      MCBAISE_MPV_PATH: '{{default "" .MPV_PATH}}'
+      MCBAISE_MPV_EXTRA_ARGS: '{{default "" .MPV_EXTRA_ARGS}}'
+      MCBAISE_MPV_COOKIES_FILE: '{{default "" .MPV_COOKIES_FILE}}'
+      MCBAISE_MPV_COOKIES_FROM_BROWSER: '{{default "" .MPV_COOKIES_FROM_BROWSER}}'
+      MCBAISE_MPV_YTDL_RAW_OPTIONS: '{{default "" .MPV_YTDL_RAW_OPTIONS}}'
+    cmds:
+      - cargo run --bin bevy_mcbaise_fantasmagoria_mpv --features native-mpv,burn_human
 
   mcbaise:wasm:toolchain:
     desc: Ensure Rust wasm target is installed
@@ -434,6 +471,43 @@ tasks:
     cmds:
       - task: mcbaise:run:backend -- backend=gl
 
+  mcbaise:run:backend:human:
+    desc: Run native demo with `burn_human` enabled and a specified WGPU backend (set `backend` var)
+    vars:
+      backend: 'vulkan'
+    env:
+      WGPU_BACKEND: '{{.backend}}'
+      RUST_BACKTRACE: 'full'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_LOG: 'bevy_render=error,wgpu=error,wgpu_core=error'
+    cmds:
+      - cd crates/bevy_Mcbaise_Pale_Regard_Absurdia_Fantasmagoria && cargo run --bin bevy_mcbaise_fantasmagoria_native --features burn_human
+
+  mcbaise:run:backend:human:vulkan:
+    desc: Run demo with Vulkan backend and `burn_human`
+    cmds:
+      - task: mcbaise:run:backend:human -- backend=vulkan
+
+  mcbaise:run:backend:human:dx12:
+    desc: Run demo with DirectX 12 backend and `burn_human`
+    cmds:
+      - task: mcbaise:run:backend:human -- backend=dx12
+
+  mcbaise:run:backend:human:dx11:
+    desc: Run demo with DirectX 11 backend and `burn_human`
+    cmds:
+      - task: mcbaise:run:backend:human -- backend=dx11
+
+  mcbaise:run:backend:human:metal:
+    desc: Run demo with Metal backend (macOS) and `burn_human`
+    cmds:
+      - task: mcbaise:run:backend:human -- backend=metal
+
+  mcbaise:run:backend:human:opengl:
+    desc: Run demo with OpenGL backend and `burn_human`
+    cmds:
+      - task: mcbaise:run:backend:human -- backend=gl
+
   # Tests
   mcbaise:test:unit:
     desc: Run unit tests for the main crate
@@ -444,3 +518,5 @@ tasks:
     desc: Run all workspace tests
     cmds:
       - cargo test --workspace
+
+  
