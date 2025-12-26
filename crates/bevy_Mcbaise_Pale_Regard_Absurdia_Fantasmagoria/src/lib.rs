@@ -18,13 +18,13 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use bevy::render::texture::GpuImage;
 use bevy::shader::ShaderRef;
-use bevy::window::{PrimaryWindow, Window};
+use bevy::window::{PrimaryWindow, Window, WindowRef};
 use bevy::camera::{RenderTarget, Viewport};
 use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
 use bevy_async_task::TaskPool;
 use futures::channel::oneshot;
 use bevy::asset::AssetId;
-use bevy_render::texture::ManualTextureViews;
+use bevy::render::extract_resource::ExtractResource;
 // UI capture/preview is optional; gated behind `capture_ui` feature when enabled.
 
 #[cfg(feature = "burn_human")]
@@ -485,6 +485,14 @@ impl bevy::render::extract_resource::ExtractResource for GpuReadbackImage {
     }
 }
 
+impl bevy::render::extract_resource::ExtractResource for OverlayUiRenderTarget {
+    type Source = OverlayUiRenderTarget;
+
+    fn extract_resource(source: &Self::Source) -> Self {
+        source.clone()
+    }
+}
+
 #[derive(Resource, Default)]
 struct GpuReadbackPending {
     active: bool,
@@ -498,8 +506,16 @@ use crossbeam_channel::{unbounded, Sender, Receiver};
 use std::any::Any;
 use bevy::render::view::window::WindowSurfaces;
 use std::collections::HashMap;
-use std::thread::sleep;
 use std::time::Duration;
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::thread::sleep;
+
+#[cfg(target_arch = "wasm32")]
+fn sleep(_d: Duration) {
+    // WASM (wasm32-unknown-unknown) does not support blocking sleeps.
+    // Any attempt to call `std::thread::sleep` will panic.
+}
 
 fn mcbaise_render_noop_logs_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -521,6 +537,7 @@ fn mcbaise_render_noop_logs_enabled() -> bool {
 // dedicated system and inline where we queue pending drops) to ensure
 // a clear fence/submission boundary before destructive surface/swapchain
 // operations occur.
+#[cfg(not(target_arch = "wasm32"))]
 fn submit_noop_and_wait(
     render_device: &bevy::render::renderer::RenderDevice,
     render_queue: &bevy::render::renderer::RenderQueue,
@@ -539,7 +556,7 @@ fn submit_noop_and_wait(
         // drivers require additional time to retire semaphore/fence state.
         while rt.last_complete_seq.load(Ordering::SeqCst) < target && tries < 60_000 {
             let _ = render_device.poll(wgpu::PollType::Wait);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            sleep(Duration::from_millis(1));
             tries = tries.saturating_add(1);
         }
         if rt.last_complete_seq.load(Ordering::SeqCst) < target {
@@ -598,7 +615,7 @@ fn submit_noop_and_wait(
     let mut tries = 0u32;
     while !flag.load(Ordering::SeqCst) && tries < 60_000 {
         let _ = render_device.poll(wgpu::PollType::Wait);
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        sleep(Duration::from_millis(1));
         tries = tries.saturating_add(1);
     }
     if !flag.load(Ordering::SeqCst) {
@@ -621,14 +638,14 @@ fn submit_noop_and_wait(
         if rt.last_complete_seq.load(Ordering::SeqCst) < seq {
             while rt.last_complete_seq.load(Ordering::SeqCst) < seq && maintain_tries < MAINTAIN_EXTRA_TRIES {
                 let _ = render_device.poll(wgpu::PollType::Wait);
-                std::thread::sleep(std::time::Duration::from_millis(1));
+                sleep(Duration::from_millis(1));
                 maintain_tries += 1;
             }
         }
         // Do a few extra polls to give Device::maintain() time to finish
         for _ in 0..16 {
             let _ = render_device.poll(wgpu::PollType::Wait);
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            sleep(Duration::from_millis(1));
         }
         if maintain_tries >= MAINTAIN_EXTRA_TRIES {
             if log_enabled {
@@ -644,8 +661,40 @@ fn submit_noop_and_wait(
     }
 }
 
+// WASM can't block the main thread. We still submit a no-op to force a
+// submission boundary, but we do not wait for completion.
+#[cfg(target_arch = "wasm32")]
+fn submit_noop_and_wait(
+    render_device: &bevy::render::renderer::RenderDevice,
+    render_queue: &bevy::render::renderer::RenderQueue,
+) {
+    let _ = mcbaise_render_noop_logs_enabled();
+
+    let mut encoder = render_device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+        label: Some("mcbaise_pre_unconfigure_noop_wasm"),
+    });
+    let finished = encoder.finish();
+    render_queue.submit(std::iter::once(finished));
+
+    // Drive a bit of progress without blocking.
+    let _ = render_device.poll(wgpu::PollType::Poll);
+}
+
 #[derive(Resource, Default, Clone)]
 struct GlobalFrameCount(u64);
+
+#[derive(Resource, Default, Clone, Copy)]
+struct LastResizeEventTime {
+    last_secs: Option<f64>,
+}
+
+fn overlay_hide_after_resize_secs() -> f64 {
+    std::env::var("MCBAISE_HIDE_OVERLAY_AFTER_RESIZE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(2.0)
+        .clamp(0.0, 10.0)
+}
 
 fn main_frame_tick_system(mut frame: ResMut<GlobalFrameCount>) {
     frame.0 = frame.0.saturating_add(1);
@@ -654,7 +703,14 @@ fn main_frame_tick_system(mut frame: ResMut<GlobalFrameCount>) {
 fn apply_deferred_window_resolution_change_system(
     frame: Res<GlobalFrameCount>,
     mut deferred: ResMut<DeferredWindowResolutionChange>,
+    mut pending_geom: ResMut<PendingWindowGeometry>,
     mut windows: Query<&mut Window, With<PrimaryWindow>>,
+    time: Res<Time>,
+    mut last_resize: ResMut<LastResizeEventTime>,
+    #[cfg(not(target_arch = "wasm32"))]
+    render_device: Res<bevy::render::renderer::RenderDevice>,
+    #[cfg(not(target_arch = "wasm32"))]
+    render_queue: Option<Res<bevy::render::renderer::RenderQueue>>,
 ) {
     if !deferred.pending {
         return;
@@ -667,15 +723,64 @@ fn apply_deferred_window_resolution_change_system(
         return;
     };
 
-    window
-        .resolution
-        .set_physical_resolution(deferred.target_w, deferred.target_h);
+    // Vulkan/wgpu: resizing reconfigures the swapchain/surface.
+    // Ensure all prior work is fully complete before we mutate window/surface state.
+    //
+    // NOTE: For stress testing, we allow opting out of the strong wait to maximize
+    // resize throughput (at the cost of potentially surfacing driver/wgpu edge cases).
+    let wait_for_idle = std::env::var("MCBAISE_DEFERRED_RESIZE_WAIT_FOR_IDLE")
+        .as_deref()
+        .ok()
+        .unwrap_or("1")
+        != "0";
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if wait_for_idle {
+            if let Some(queue) = render_queue {
+                submit_noop_and_wait(&*render_device, &*queue);
+            }
+            wait_for_device_idle_strong(&*render_device);
+        }
+    }
+
+    // Apply the requested size.
+    // We store targets in *physical pixels* (used for render targets / readback).
+    // However, on some platforms `set_physical_resolution` can update Bevy's
+    // internal bookkeeping without actually changing the OS window size.
+    //
+    // To ensure the OS window actually resizes, request a logical size derived
+    // from the desired physical size and the current scale factor.
+    //
+    // Never request a 0-sized window.
+    let target_w = deferred.target_w.max(1);
+    let target_h = deferred.target_h.max(1);
+
+    let before_w = window.physical_width();
+    let before_h = window.physical_height();
+    let scale = window.scale_factor().max(1.0);
+    let logical_w = (target_w as f32 / scale).max(1.0);
+    let logical_h = (target_h as f32 / scale).max(1.0);
+    window.resolution.set(logical_w, logical_h);
+
+    // Keep pending targets aligned with the requested physical size.
+    // The settle watcher tolerates minor DPI rounding differences.
+    pending_geom.target_w = target_w;
+    pending_geom.target_h = target_h;
+
     deferred.pending = false;
+    last_resize.last_secs = Some(time.elapsed_secs_f64());
     eprintln!(
-        "native: applying deferred window geometry -> {}x{} (frame={})",
-        deferred.target_w,
-        deferred.target_h,
-        frame.0
+        "native: applying deferred window geometry -> requested_phys={}x{} requested_logical={:.2}x{:.2} scale_factor={:.3} before_phys={}x{} after_phys={}x{} (frame={})",
+        target_w,
+        target_h,
+        logical_w,
+        logical_h,
+        scale,
+        before_w,
+        before_h,
+        window.physical_width(),
+        window.physical_height(),
+        frame.0,
     );
 }
 
@@ -687,18 +792,42 @@ fn schedule_window_geometry_change(
     now_frame: u64,
     reason: &'static str,
 ) {
+    // Guard against 0-sized requests (see apply_deferred_window_resolution_change_system).
+    let w = w.max(1);
+    let h = h.max(1);
+
     // Mark pending immediately so camera gating can kick in this frame,
     // but defer the actual window resize until next frame so the render
     // world sees cameras disabled before the surface is reconfigured.
     pending_window_geometry.pending = true;
     pending_window_geometry.target_w = w;
     pending_window_geometry.target_h = h;
-    pending_window_geometry.scheduled_frame = Some(now_frame + 1);
 
+    // Important for responsiveness: do NOT keep pushing the scheduled/apply
+    // frame forward on every request. If we always set to `now_frame + 1`, a
+    // steady stream of resize requests will defer forever and the window will
+    // "step" only after the user stops interacting.
+    //
+    // Instead, schedule the apply for the *next* frame if none is scheduled
+    // yet, and otherwise keep the existing (earlier) schedule while updating
+    // the target size.
+    let desired = now_frame + 1;
+    pending_window_geometry.scheduled_frame = Some(
+        pending_window_geometry
+            .scheduled_frame
+            .unwrap_or(desired)
+            .min(desired),
+    );
+
+    let was_pending = deferred.pending;
     deferred.pending = true;
     deferred.target_w = w;
     deferred.target_h = h;
-    deferred.apply_frame = now_frame + 1;
+    deferred.apply_frame = if was_pending {
+        deferred.apply_frame.min(desired)
+    } else {
+        desired
+    };
 
     eprintln!(
         "native: {reason} window geometry -> {}x{} (defer_apply_frame={}, now_frame={})",
@@ -733,6 +862,10 @@ fn auto_cycle_resolution_system(
         return;
     }
     if auto.max_cycles > 0 && auto.cycles_done >= auto.max_cycles {
+        eprintln!(
+            "native: auto-cycled resizes reached max_cycles={} -> requesting AppExit::Success",
+            auto.max_cycles
+        );
         app_exit.write(AppExit::Success);
         return;
     }
@@ -1054,6 +1187,8 @@ struct ResizeAutomation {
     width: u16,
     height: u16,
     phase: Phase,
+    step_px: u16,
+    wait_for_settle: bool,
     first_frame: bool,
     next_step_frame: u64,
     step_every_frames: u64,
@@ -1072,6 +1207,8 @@ impl Default for ResizeAutomation {
             width: 401,
             height: 401,
             phase: Phase::ContractingY,
+            step_px: 4,
+            wait_for_settle: true,
             first_frame: false,
             next_step_frame: 0,
             step_every_frames: 12,
@@ -1173,6 +1310,15 @@ impl Default for LoadingState {
 struct GpuReadbackCaptureCamera {
     index: u8,
 }
+
+#[derive(Component)]
+struct ReadbackCompositeCamera;
+
+#[derive(Component)]
+struct ReadbackCompositeSceneQuad;
+
+#[derive(Component)]
+struct ReadbackCompositeUiQuad;
 
 fn ensure_gpu_capture_camera_exists(
     mut commands: Commands,
@@ -1438,6 +1584,123 @@ fn ensure_readback_image_exists(
     readback.0 = handle;
 }
 
+fn ensure_main_scene_render_target_exists(
+    mut target: ResMut<MainSceneRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if target.0 != Handle::default() {
+        return;
+    }
+
+    // Start with a tiny image; it will be resized to the window size once the
+    // window size is stable.
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+        | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+
+    // Label the render target texture so wgpu/core logs are easier to interpret.
+    #[allow(unused_assignments)]
+    {
+        #[allow(unused_mut)]
+        let _ = match &mut image.texture_descriptor.label {
+            Some(_) => {
+                image.texture_descriptor.label = Some("mcbaise_main_scene_target");
+                true
+            }
+            None => false,
+        };
+    }
+
+    target.0 = images.add(image);
+}
+
+fn ensure_overlay_ui_render_target_exists(
+    mut target: ResMut<OverlayUiRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if target.0 != Handle::default() {
+        return;
+    }
+
+    // Separate transparent UI target. Keeping UI writes out of the main scene
+    // target avoids cross-graph ordering hazards (Core2D vs Core3D).
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 0],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+        | bevy::render::render_resource::TextureUsages::COPY_SRC
+        | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+
+    #[allow(unused_assignments)]
+    {
+        #[allow(unused_mut)]
+        let _ = match &mut image.texture_descriptor.label {
+            Some(_) => {
+                image.texture_descriptor.label = Some("mcbaise_overlay_ui_target");
+                true
+            }
+            None => false,
+        };
+    }
+
+    target.0 = images.add(image);
+}
+
+fn ensure_present_dummy_render_target_exists(
+    mut target: ResMut<PresentDummyRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if target.0 != Handle::default() {
+        return;
+    }
+
+    let mut image = Image::new_fill(
+        Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        &[0, 0, 0, 255],
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+    );
+    image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+        | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+
+    #[allow(unused_assignments)]
+    {
+        #[allow(unused_mut)]
+        let _ = match &mut image.texture_descriptor.label {
+            Some(_) => {
+                image.texture_descriptor.label = Some("mcbaise_present_dummy_target");
+                true
+            }
+            None => false,
+        };
+    }
+
+    target.0 = images.add(image);
+}
+
 fn resize_readback_image_to_window(
     windows: Query<&Window, With<PrimaryWindow>>,
     readback: Option<Res<GpuReadbackImage>>,
@@ -1469,7 +1732,15 @@ fn resize_readback_image_to_window(
 fn arm_cameras_for_gpu_readback(
     mut pending: ResMut<GpuReadbackPending>,
     readback: Option<Res<GpuReadbackImage>>,
-    mut cap_cam: Query<&mut Camera, With<GpuReadbackCaptureCamera>>,
+    mut cap_cam: Query<
+        &mut Camera,
+        (With<GpuReadbackCaptureCamera>, Without<ReadbackCompositeCamera>),
+    >,
+    #[cfg(not(target_arch = "wasm32"))]
+    mut composite_cam: Query<
+        &mut Camera,
+        (With<ReadbackCompositeCamera>, Without<GpuReadbackCaptureCamera>),
+    >,
 ) {
     let seq = READBACK_REQUEST_SEQ.load(Ordering::SeqCst);
     if seq == 0 {
@@ -1505,7 +1776,16 @@ fn arm_cameras_for_gpu_readback(
         return;
     }
 
-    // Enable ALL capture cameras for a few frames.
+    let include_overlay = std::env::var("MCBAISE_READBACK_INCLUDE_OVERLAY")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+
+    // Always use the proven direct capture cameras to render the scene into the
+    // readback image. If `MCBAISE_READBACK_INCLUDE_OVERLAY=1`, we will composite
+    // the overlay UI over the captured pixels on the CPU during the readback
+    // mapping step.
     if cap_cam.is_empty() {
         let last = READBACK_DEBUG_LAST_SEQ_ARM.load(Ordering::SeqCst);
         if last != seq {
@@ -1517,9 +1797,13 @@ fn arm_cameras_for_gpu_readback(
         }
         return;
     }
-
     for mut cam in &mut cap_cam {
         cam.is_active = true;
+        cam.target = RenderTarget::Image(readback.0.clone().into());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    for mut cam in &mut composite_cam {
+        cam.is_active = false;
     }
 
     pending.active = true;
@@ -1535,14 +1819,22 @@ fn arm_cameras_for_gpu_readback(
         READBACK_DEBUG_LAST_SEQ_ARM.store(seq, Ordering::SeqCst);
         wasm_dbg_kv(
             "wasm:gpu_readback: armed capture cameras seq=",
-            &format!("{seq} count={} frames_left={}", cap_cam.iter().count(), pending.frames_left),
+            &format!("{seq} include_overlay={} frames_left={}", include_overlay as u8, pending.frames_left),
         );
     }
 }
 
 fn restore_cameras_after_gpu_readback(
     mut pending: ResMut<GpuReadbackPending>,
-    mut cap_cam: Query<&mut Camera, With<GpuReadbackCaptureCamera>>,
+    mut cap_cam: Query<
+        &mut Camera,
+        (With<GpuReadbackCaptureCamera>, Without<ReadbackCompositeCamera>),
+    >,
+    #[cfg(not(target_arch = "wasm32"))]
+    mut composite_cam: Query<
+        &mut Camera,
+        (With<ReadbackCompositeCamera>, Without<GpuReadbackCaptureCamera>),
+    >,
 ) {
     if !pending.active {
         return;
@@ -1564,6 +1856,11 @@ fn restore_cameras_after_gpu_readback(
     for mut cam in &mut cap_cam {
         cam.is_active = false;
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    for mut cam in &mut composite_cam {
+        cam.is_active = false;
+    }
     pending.active = false;
 }
 
@@ -1573,6 +1870,7 @@ fn gpu_readback_render_system(
     gpu_images: Res<bevy::render::render_asset::RenderAssets<GpuImage>>,
     mut staging_res: ResMut<ReadbackStaging>,
     readback: Option<Res<GpuReadbackImage>>,
+    overlay_target: Option<Res<OverlayUiRenderTarget>>,
 ) {
     let seq = READBACK_REQUEST_SEQ.load(Ordering::SeqCst);
     if seq == 0 {
@@ -1656,7 +1954,54 @@ fn gpu_readback_render_system(
     let unpadded_bytes_per_row = width * bytes_per_pixel;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     let padded_bytes_per_row = ((unpadded_bytes_per_row + align - 1) / align) * align;
-    let buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+    let base_buffer_size = (padded_bytes_per_row as u64) * (height as u64);
+
+    let include_overlay = std::env::var("MCBAISE_READBACK_INCLUDE_OVERLAY")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+
+    // If requested, attempt to also copy the overlay UI render target and composite on CPU.
+    // This avoids relying on a GPU-side composite camera (which can go black depending on
+    // pipeline state/order).
+    let mut overlay_gpu_image: Option<GpuImage> = None;
+    if include_overlay {
+        if let Some(overlay_target) = overlay_target.as_ref() {
+            if overlay_target.0 != Handle::default() {
+                if let Some(gpu_overlay) = gpu_images.get(overlay_target.0.id()) {
+                    if gpu_overlay.size.width == width && gpu_overlay.size.height == height {
+                        overlay_gpu_image = Some(gpu_overlay.clone());
+                    } else {
+                        eprintln!(
+                            "gpu_readback: overlay size mismatch (overlay={}x{}, scene={}x{}); skipping overlay composite",
+                            gpu_overlay.size.width,
+                            gpu_overlay.size.height,
+                            width,
+                            height
+                        );
+                    }
+                } else {
+                    eprintln!("gpu_readback: missing GpuImage for OverlayUiRenderTarget; skipping overlay composite");
+                }
+            }
+        } else {
+            eprintln!("gpu_readback: OverlayUiRenderTarget not extracted; skipping overlay composite");
+        }
+    }
+
+    let overlay_offset = if overlay_gpu_image.is_some() {
+        // Align to 256 for safety (wgpu requires offset alignment for some copy paths).
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
+        ((base_buffer_size + align - 1) / align) * align
+    } else {
+        0
+    };
+    let buffer_size = if overlay_gpu_image.is_some() {
+        overlay_offset + base_buffer_size
+    } else {
+        base_buffer_size
+    };
 
     eprintln!("gpu_readback: need staging {} bytes ({}x{})", buffer_size, width, height);
 
@@ -1682,6 +2027,7 @@ fn gpu_readback_render_system(
 
     eprintln!("native(render): create encoder label=mcbaise_readback_encoder frame_seq={}", READBACK_REQUEST_SEQ.load(Ordering::SeqCst));
 
+    // Copy the scene (readback target) pixels.
     encoder.copy_texture_to_buffer(
         gpu_image.texture.as_image_copy(),
         wgpu::TexelCopyBufferInfo {
@@ -1698,6 +2044,26 @@ fn gpu_readback_render_system(
             depth_or_array_layers: 1,
         },
     );
+
+    // Optionally copy overlay UI pixels into the staging buffer at a second offset.
+    if let Some(overlay_gpu) = overlay_gpu_image.as_ref() {
+        encoder.copy_texture_to_buffer(
+            overlay_gpu.texture.as_image_copy(),
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buffer,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: overlay_offset,
+                    bytes_per_row: Some(padded_bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
 
     let finished = encoder.finish();
     let my_seq = SUBMIT_SEQ_COUNTER.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1732,6 +2098,35 @@ fn gpu_readback_render_system(
             let dst_start = row * (unpadded_bytes_per_row as usize);
             out[dst_start..dst_start + (unpadded_bytes_per_row as usize)]
                 .copy_from_slice(&data[src_start..src_start + (unpadded_bytes_per_row as usize)]);
+        }
+
+        // If overlay bytes were copied into this staging buffer, alpha-composite them over
+        // the captured scene. We assume the overlay color is premultiplied (common for UI).
+        // Blend: dst = src + dst * (1 - a)
+        if overlay_offset != 0 {
+            let pr = padded_bytes_per_row as usize;
+            let ur = unpadded_bytes_per_row as usize;
+            for row in 0..(height as usize) {
+                let ov_src_start = (overlay_offset as usize) + row * pr;
+                let dst_row = row * ur;
+                let overlay_row = &data[ov_src_start..ov_src_start + ur];
+                let out_row = &mut out[dst_row..dst_row + ur];
+                for px in 0..(width as usize) {
+                    let i = px * 4;
+                    let a = overlay_row[i + 3] as u32;
+                    if a == 0 {
+                        continue;
+                    }
+                    let inv_a = 255u32.saturating_sub(a);
+                    for c in 0..3 {
+                        let src = overlay_row[i + c] as u32;
+                        let dst = out_row[i + c] as u32;
+                        let blended = src + ((dst * inv_a + 127) / 255);
+                        out_row[i + c] = blended.min(255) as u8;
+                    }
+                    out_row[i + 3] = 255;
+                }
+            }
         }
 
         // checksum/sample
@@ -1845,10 +2240,10 @@ fn gpu_readback_poll_system(render_device: Res<bevy::render::renderer::RenderDev
     let _ = render_device.poll(wgpu::PollType::Poll);
 }
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "burn_human"))]
 const META_BYTES: &[u8] = include_bytes!("../../../assets/model/fullbody_default.meta.json");
 
-#[cfg(target_arch = "wasm32")]
+#[cfg(all(target_arch = "wasm32", feature = "burn_human"))]
 const TENSOR_LZ4_BYTES: &[u8] = include_bytes!(concat!(
     env!("OUT_DIR"),
     "/fullbody_default.safetensors.lz4"
@@ -4276,13 +4671,75 @@ fn pose_from_local_hit_dir(local_hit_dir: Vec3) -> PoseMode {
 #[derive(Component)]
 struct MainCamera;
 
-#[cfg(not(target_arch = "wasm32"))]
 #[derive(Component)]
 struct OverlayUiCamera;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct PresentCamera;
+
+#[derive(Resource, Clone, Default)]
+struct PresentCameraMainEntity(pub Option<Entity>);
+
+#[derive(Resource, Clone, Default)]
+struct OverlayUiCameraMainEntity(pub Option<Entity>);
+
+impl ExtractResource for OverlayUiCameraMainEntity {
+    type Source = OverlayUiCameraMainEntity;
+
+    fn extract_resource(source: &Self::Source) -> Self {
+        source.clone()
+    }
+}
+
+impl ExtractResource for PresentCameraMainEntity {
+    type Source = PresentCameraMainEntity;
+
+    fn extract_resource(source: &Self::Source) -> Self {
+        source.clone()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct PresentSprite;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct PresentSceneQuad;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Component)]
+struct PresentUiQuad;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Resource, Default)]
+struct PresentDebugPrinted(pub bool);
 
 #[derive(Component, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct ViewCamera {
     index: u8,
+}
+
+#[derive(Resource, Default, Clone)]
+struct MainSceneRenderTarget(pub Handle<Image>);
+
+#[derive(Resource, Default, Clone)]
+struct OverlayUiRenderTarget(pub Handle<Image>);
+
+#[derive(Resource, Default, Clone)]
+struct PresentDummyRenderTarget(pub Handle<Image>);
+
+#[derive(Resource, Clone, Copy, Debug)]
+struct StableMainRenderSize {
+    width: u32,
+    height: u32,
+}
+
+impl Default for StableMainRenderSize {
+    fn default() -> Self {
+        Self { width: 1, height: 1 }
+    }
 }
 
 #[derive(Resource, Clone, Copy)]
@@ -5056,6 +5513,16 @@ pub fn main() {
     app.init_resource::<GpuReadbackImage>();
     app.init_resource::<GpuReadbackPending>();
     app.init_resource::<PendingWindowGeometry>();
+    app.init_resource::<LastResizeEventTime>();
+    app.init_resource::<MainSceneRenderTarget>();
+    app.init_resource::<OverlayUiRenderTarget>();
+    app.init_resource::<PresentDummyRenderTarget>();
+    app.init_resource::<PresentCameraMainEntity>();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<OverlayUiCameraMainEntity>();
+    #[cfg(not(target_arch = "wasm32"))]
+    app.init_resource::<PresentDebugPrinted>();
+    app.init_resource::<StableMainRenderSize>();
     app.init_resource::<ResizeAutomation>();
     app.init_resource::<CameraRestartRequested>();
     app.init_resource::<SceneRestartRequested>();
@@ -5063,13 +5530,18 @@ pub fn main() {
     app.init_resource::<LoadingState>();
     app.init_resource::<BurnHumanSpawned>();
     app.insert_resource(BurnHumanEnabled::default());
-    app.add_systems(Startup, ensure_readback_image_exists);
+    app.add_systems(Startup, ensure_readback_image_exists.before(setup_scene));
+    app.add_systems(Startup, ensure_main_scene_render_target_exists.before(setup_scene));
+    app.add_systems(Startup, ensure_overlay_ui_render_target_exists.before(setup_scene));
+    app.add_systems(Startup, ensure_present_dummy_render_target_exists.before(setup_scene));
 
     // Optional automation: drive the resize stepper (the same behavior as the UI
     // resize icon) without user interaction.
     // - MCBAISE_AUTORESIZE=1
     // - MCBAISE_AUTORESIZE_START_FRAME=120 (default)
     // - MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES=12 (default)
+    // - MCBAISE_AUTORESIZE_STEP_PX=4 (default)
+    // - MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE=1 (default)
     // - MCBAISE_AUTORESIZE_MAX_STEPS=0 (0 = infinite)
     if std::env::var("MCBAISE_AUTORESIZE").as_deref().ok() == Some("1") {
         let autoresize_start_frame: u64 = std::env::var("MCBAISE_AUTORESIZE_START_FRAME")
@@ -5084,12 +5556,23 @@ pub fn main() {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
+        let autoresize_step_px: u16 = std::env::var("MCBAISE_AUTORESIZE_STEP_PX")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4);
+        let autoresize_wait_for_settle: bool = std::env::var("MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE")
+            .as_deref()
+            .ok()
+            .unwrap_or("1")
+            != "0";
 
         let mut auto = app.world_mut().resource_mut::<ResizeAutomation>();
         auto.active = true;
         auto.env_forced = true;
         auto.start_frame = autoresize_start_frame;
         auto.step_every_frames = autoresize_step_every_frames.max(1);
+        auto.step_px = autoresize_step_px.max(1);
+        auto.wait_for_settle = autoresize_wait_for_settle;
         auto.max_steps = autoresize_max_steps;
         auto.steps_done = 0;
         auto.exit_requested = false;
@@ -5097,9 +5580,11 @@ pub fn main() {
         auto.first_frame = false;
         auto.next_step_frame = 0;
         eprintln!(
-            "native: env autoresize enabled (start_frame={}, step_every_frames={}, max_steps={})",
+            "native: env autoresize enabled (start_frame={}, step_every_frames={}, step_px={}, wait_for_settle={}, max_steps={})",
             auto.start_frame,
             auto.step_every_frames,
+            auto.step_px,
+            auto.wait_for_settle,
             auto.max_steps
         );
     }
@@ -5123,6 +5608,16 @@ pub fn main() {
             .after(apply_deferred_window_resolution_change_system)
             .after(resize_automation_step),
     );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        track_interactive_window_resize_system
+            .after(main_frame_tick_system)
+            .before(window_geometry_watch_system),
+    );
+    // `gate_main_cameras_during_geometry_system` is native-only. Keep the ordering
+    // constraint on native, and skip it on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
         Update,
         resize_automation_step
@@ -5130,6 +5625,13 @@ pub fn main() {
             // Ensure camera gating observes the previous frame's pending state,
             // but do not let scheduling a new step disable cameras in the same frame.
             .after(gate_main_cameras_during_geometry_system)
+            .before(window_geometry_watch_system),
+    );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        resize_automation_step
+            .after(main_frame_tick_system)
             .before(window_geometry_watch_system),
     );
     app.add_systems(Update, sync_resize_toggle_system);
@@ -5156,11 +5658,10 @@ pub fn main() {
     app.add_systems(Update, resize_readback_image_to_window);
     app.add_systems(Update, arm_cameras_for_gpu_readback);
     app.add_systems(Update, restore_cameras_after_gpu_readback);
-        // Native: we create the primary egui context ourselves (on a dedicated overlay camera)
-        // so it isn't constrained by the first 3D camera's viewport.
-        // WASM: keep the default auto-created primary context.
+        // We create the primary egui context ourselves (on a dedicated full-window overlay camera)
+        // so it isn't constrained by any 3D camera viewport (multi-view splits, etc.).
     app.insert_resource(bevy_egui::EguiGlobalSettings {
-            auto_create_primary_context: cfg!(target_arch = "wasm32"),
+            auto_create_primary_context: false,
             ..default()
         })
         .init_resource::<SubjectMode>()
@@ -5240,6 +5741,10 @@ pub fn main() {
     // be extracted into the render world, causing "render world missing GpuReadbackImage".
     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<GpuReadbackImage>::default());
     app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<PendingWindowGeometry>::default());
+    app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<OverlayUiRenderTarget>::default());
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<OverlayUiCameraMainEntity>::default());
+    app.add_plugins(bevy::render::extract_resource::ExtractResourcePlugin::<PresentCameraMainEntity>::default());
 
     // Initialize a persistent staging buffer resource used by the render-side
     // readback system so we don't allocate/destroy many wgpu buffers per capture.
@@ -5329,11 +5834,198 @@ pub fn main() {
     render_app.init_resource::<StashedAssetsImage>();
     render_app.init_resource::<StashedRenderAssetsGpuImage>();
     render_app.init_resource::<CompletedDropIds>();
+
+    #[derive(Resource, Default)]
+    struct RenderPresentDebugPrinted(pub bool);
+    render_app.init_resource::<RenderPresentDebugPrinted>();
     #[derive(Resource, Default)]
     struct RenderGraphDumpDone(pub bool);
     render_app.add_systems(
         bevy::render::Render,
         render_frame_tick_system.in_set(RenderSystems::Cleanup),
+    );
+
+    // Render-world debug: verify what the renderer actually sees (extracted
+    // window resources + cameras). This is critical when the main world says
+    // the PresentCamera is active, but the OS window remains grey/black.
+    //
+    // Additionally: on some configurations Bevy can end up with multiple
+    // extracted cameras still targeting the Primary swapchain. If any of those
+    // cameras clear the swapchain, they can overwrite our present pass and
+    // produce a solid grey/black window even though the offscreen targets are
+    // correct. Enforce the rule *in the render world* as the final authority.
+    fn render_enforce_single_primary_window_camera_system(
+        present_main: Option<Res<PresentCameraMainEntity>>,
+        overlay_main: Option<Res<OverlayUiCameraMainEntity>>,
+        pending_geom: Option<Res<PendingWindowGeometry>>,
+        mut cams: Query<(
+            Entity,
+            &mut Camera,
+            Option<&bevy::render::sync_world::MainEntity>,
+        )>,
+    ) {
+        // This enforcement is only valid when we are explicitly using the
+        // offscreen-present path (readback/recording). In normal runs we want
+        // the 3D world cameras to render directly to the window.
+        if !offscreen_present_mode_enabled() {
+            return;
+        }
+
+        let allow_clear = std::env::var("MCBAISE_PRESENT_DEBUG_CLEAR")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+
+        // Prefer keeping the extracted PresentCamera and OverlayUiCamera (identified by their
+        // MainEntity mapping) so we don't accidentally keep a default camera that clears.
+        let mut keep_present: Option<Entity> = None;
+        let mut keep_overlay: Option<Entity> = None;
+
+        if let Some(main) = present_main.as_ref().and_then(|r| r.0) {
+            for (ent, cam, main_ent) in &cams {
+                if !matches!(cam.target, RenderTarget::Window(_)) {
+                    continue;
+                }
+                if let Some(main_ent) = main_ent {
+                    if main_ent.id() == main {
+                        keep_present = Some(ent);
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Some(main) = overlay_main.as_ref().and_then(|r| r.0) {
+            for (ent, cam, main_ent) in &cams {
+                if !matches!(cam.target, RenderTarget::Window(_)) {
+                    continue;
+                }
+                if let Some(main_ent) = main_ent {
+                    if main_ent.id() == main {
+                        keep_overlay = Some(ent);
+                        break;
+                    }
+                }
+            }
+        }
+
+        let Some(keep_present) = keep_present else {
+            return;
+        };
+
+        let resize_pending = pending_geom.as_ref().is_some_and(|p| p.pending);
+
+        // Disable all other window-target cameras so they can't clear or draw over the present pass.
+        for (ent, mut cam, _main_ent) in &mut cams {
+            if !matches!(cam.target, RenderTarget::Window(_)) {
+                continue;
+            }
+
+            if ent == keep_present {
+                // Respect extracted camera activation where possible; the main world
+                // controls whether the present camera is active.
+                cam.order = 0;
+                if !allow_clear {
+                    cam.clear_color = ClearColorConfig::None;
+                }
+                continue;
+            }
+
+            if let Some(keep_overlay) = keep_overlay {
+                if ent == keep_overlay {
+                    let requested_active = cam.is_active;
+                    cam.is_active = requested_active && !resize_pending;
+                    cam.order = 1;
+                    cam.clear_color = ClearColorConfig::None;
+                    continue;
+                }
+            }
+
+            cam.is_active = false;
+            cam.clear_color = ClearColorConfig::None;
+        }
+    }
+
+    fn render_debug_present_world_system(
+        mut printed: ResMut<RenderPresentDebugPrinted>,
+        frame: Res<GlobalFrameCount>,
+        ws_res: Option<Res<WindowSurfaces>>,
+        extracted: Option<Res<bevy::render::view::window::ExtractedWindows>>,
+        cams: Query<(
+            Entity,
+            &Camera,
+            Option<&bevy::render::sync_world::MainEntity>,
+        )>,
+    ) {
+        let enabled = std::env::var("MCBAISE_DEBUG_PRESENT")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+        if !enabled || printed.0 {
+            return;
+        }
+        if frame.0 < 10 {
+            return;
+        }
+        printed.0 = true;
+
+        eprintln!(
+            "present_debug(render): resources: WindowSurfaces={} ExtractedWindows={}",
+            ws_res.is_some() as u8,
+            extracted.is_some() as u8
+        );
+
+        if let Some(ex) = extracted {
+            let mut count = 0usize;
+            let mut first: Option<(u32, u32)> = None;
+            for (_ent, w) in ex.iter() {
+                count += 1;
+                if first.is_none() {
+                    first = Some((w.physical_width, w.physical_height));
+                }
+            }
+            if let Some((w, h)) = first {
+                eprintln!(
+                    "present_debug(render): ExtractedWindows count={} first_physical={}x{}",
+                    count, w, h
+                );
+            } else {
+                eprintln!("present_debug(render): ExtractedWindows count=0");
+            }
+        }
+
+        eprintln!("present_debug(render): window-target cameras (Primary):");
+        let mut any = false;
+        for (ent, cam, main_ent) in &cams {
+            let RenderTarget::Window(win_ref) = &cam.target else {
+                continue;
+            };
+            if !matches!(win_ref, WindowRef::Primary) {
+                continue;
+            }
+            any = true;
+            eprintln!(
+                "present_debug(render): - entity={:?} main={:?} active={} order={} clear={:?}",
+                ent,
+                main_ent.map(|m| m.id()),
+                cam.is_active,
+                cam.order,
+                cam.clear_color
+            );
+        }
+        if !any {
+            eprintln!("present_debug(render): - <none>");
+        }
+    }
+    render_app.add_systems(
+        bevy::render::Render,
+        render_enforce_single_primary_window_camera_system.in_set(RenderSystems::Prepare),
+    );
+    render_app.add_systems(
+        bevy::render::Render,
+        render_debug_present_world_system.in_set(RenderSystems::Prepare),
     );
 
     // Debug/probe logging for render scheduling and attachments can be very
@@ -6066,8 +6758,52 @@ pub fn main() {
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(
         Update,
+        gate_present_camera_system
+            .after(update_overlay_ui_camera)
+            .after(auto_cycle_resolution_system)
+            .after(resize_automation_step)
+            .after(cycle_resolution_on_resize_icon_request_system)
+            .after(apply_deferred_window_resolution_change_system),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
         gate_main_cameras_during_geometry_system.after(gate_overlay_ui_camera_system),
     );
+
+    // Offscreen presentation: keep a stable render target during resizes and
+    // present it as a full-window sprite.
+    app.add_systems(
+        Update,
+        resize_main_scene_render_target_when_stable.before(update_multiview_viewports),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        resize_overlay_ui_render_target_when_stable.before(update_overlay_ui_camera),
+    );
+    app.add_systems(
+        Update,
+        route_view_cameras_to_main_scene_target.after(sync_view_cameras),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, sync_present_camera_projection_to_window);
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        PostUpdate,
+        update_present_quads_to_window.after(bevy::camera::CameraUpdateSystems),
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(
+        Update,
+        enforce_only_present_camera_targets_window
+            .after(route_view_cameras_to_main_scene_target)
+            .after(gate_present_camera_system)
+            .after(sync_present_camera_projection_to_window)
+            ,
+    );
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, debug_present_status_system);
 
     // Execution-phase systems: perform actual camera/scene despawn+recreate
     // once the render cleanup monitor has signalled readiness.
@@ -6087,6 +6823,10 @@ pub fn main() {
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, (advance_time_native, native_controls, gif_auto_capture_system));
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, auto_one_shot_readback_system.after(loading_watch_system));
+    #[cfg(not(target_arch = "wasm32"))]
+    app.add_systems(Update, auto_exit_after_one_shot_readback_system);
 
     #[cfg(all(not(target_arch = "wasm32"), feature = "native-youtube"))]
     {
@@ -6796,6 +7536,9 @@ fn setup_scene(
     mut tube_materials: ResMut<Assets<TubeMaterial>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    main_scene_target: Res<MainSceneRenderTarget>,
+    overlay_ui_target: Res<OverlayUiRenderTarget>,
+    readback: Option<Res<GpuReadbackImage>>,
 ) {
     #[cfg(target_arch = "wasm32")]
     wasm_dbg("wasm: setup_scene() entered");
@@ -6972,24 +7715,258 @@ fn setup_scene(
         commands.insert_resource(BurnHumanSpawned(true));
     }
 
-    // Native: a dedicated full-window overlay camera for egui captions/credits/UI.
-    // This avoids anchoring egui to the first 3D camera's viewport when multiview is enabled.
+    // Native: present the main 3D render target as a full-window sprite.
+    // This decouples ongoing animation from window surface reconfiguration.
     #[cfg(not(target_arch = "wasm32"))]
-    commands.spawn((
-        Camera2d,
-        Camera {
-            viewport: None,
-            order: 10_000,
-            clear_color: ClearColorConfig::None,
+    {
+        // Keep presentation/compositing cameras from accidentally rendering the 3D world.
+        // If the PresentCamera can see the tube scene, enabling it during resize will
+        // show a "jacked" view (wrong camera) instead of the composited targets.
+        let present_layers = bevy::camera::visibility::RenderLayers::layer(30);
+        let readback_layers = bevy::camera::visibility::RenderLayers::layer(31);
+
+        let debug_present = std::env::var("MCBAISE_DEBUG_PRESENT")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+
+        let present_debug_solid = std::env::var("MCBAISE_PRESENT_DEBUG_SOLID")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+
+        // Keep debug logging independent from material selection.
+        // `MCBAISE_DEBUG_PRESENT=1` should not force solid colors; otherwise it
+        // makes it impossible to debug the real on-screen composite.
+        let present_debug_solid = present_debug_solid;
+
+        let present_debug_clear = std::env::var("MCBAISE_PRESENT_DEBUG_CLEAR")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+
+        // Present to the window surface using Core3D instead of Core2D.
+        // The Core2D window pass has been implicated in Vulkan swapchain/
+        // resize validation errors under rapid resizing.
+        let present_camera_entity = commands
+            .spawn((
+            Camera3d::default(),
+            Projection::Orthographic({
+                let mut proj = OrthographicProjection::default_3d();
+                proj.scaling_mode = bevy::camera::ScalingMode::WindowSize;
+                // Be explicit about depth range so the full-screen quad can't
+                // get clipped by backend-specific near/far conventions.
+                proj.near = -10.0;
+                proj.far = 10.0;
+                proj
+            }),
+            Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+            GlobalTransform::default(),
+            Camera {
+                viewport: None,
+                order: 10_000,
+                target: RenderTarget::Window(WindowRef::Primary),
+                clear_color: if present_debug_clear {
+                    ClearColorConfig::Custom(Color::srgb(0.0, 0.2, 1.0))
+                } else {
+                    ClearColorConfig::None
+                },
+                ..default()
+            },
+            present_layers.clone(),
+            PresentCamera,
+            Name::new("present_camera"),
+        ))
+            .id();
+
+        // Make the main-world PresentCamera entity id available for render-world enforcement.
+        commands.insert_resource(PresentCameraMainEntity(Some(present_camera_entity)));
+
+        if debug_present {
+            eprintln!(
+                "present_debug: setup_scene present_debug_solid={} present_debug_clear={}",
+                present_debug_solid as u8,
+                present_debug_clear as u8
+            );
+        }
+
+        // Use a known-size 1x1 plane so our per-frame scaling (in pixels)
+        // is unambiguous. `Plane3d::default()` has a larger default extent.
+        let quad_mesh = meshes.add(Mesh::from(bevy::math::primitives::Plane3d {
+            half_size: Vec2::splat(0.5),
             ..default()
-        },
-        OverlayUiCamera,
-        bevy_egui::PrimaryEguiContext,
-        Name::new("overlay_ui_camera"),
-    ));
+        }));
+
+        let scene_mat = if present_debug_solid {
+            std_materials.add(StandardMaterial {
+                base_color: Color::srgb(1.0, 0.0, 1.0),
+                base_color_texture: None,
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            })
+        } else {
+            std_materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(main_scene_target.0.clone()),
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            })
+        };
+        let ui_mat = if present_debug_solid {
+            std_materials.add(StandardMaterial {
+                base_color: Color::srgb(0.0, 1.0, 0.0).with_alpha(0.5),
+                base_color_texture: None,
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        } else {
+            std_materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(overlay_ui_target.0.clone()),
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            })
+        };
+
+        commands.spawn((
+            Mesh3d(quad_mesh.clone()),
+            MeshMaterial3d(scene_mat),
+            // `Plane3d` is an XZ plane; rotate it into the XY plane so the
+            // present camera (looking down -Z) can see it.
+            Transform::from_xyz(0.0, 0.0, 0.5)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            present_layers.clone(),
+            PresentSceneQuad,
+            Name::new("present_scene_quad"),
+        ));
+        commands.spawn((
+            Mesh3d(quad_mesh),
+            MeshMaterial3d(ui_mat),
+            Transform::from_xyz(0.0, 0.0, 0.5001)
+                .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+            GlobalTransform::default(),
+            Visibility::Visible,
+            present_layers,
+            PresentUiQuad,
+            Name::new("present_ui_quad"),
+        ));
+
+        // Optional: composite (scene + overlay) into the GPU readback image.
+        // This stays entirely offscreen and uses Core3D textured quads.
+        if let Some(readback) = readback.as_ref()
+            && readback.0 != Handle::default()
+        {
+            commands.spawn((
+                Camera3d::default(),
+                Projection::Orthographic({
+                    let mut proj = OrthographicProjection::default_3d();
+                    proj.scaling_mode = bevy::camera::ScalingMode::WindowSize;
+                    proj
+                }),
+                Transform::from_xyz(0.0, 0.0, 1.0).looking_at(Vec3::ZERO, Vec3::Y),
+                GlobalTransform::default(),
+                Camera {
+                    viewport: None,
+                    order: 20_000,
+                    target: RenderTarget::Image(readback.0.clone().into()),
+                    clear_color: ClearColorConfig::Default,
+                    is_active: false,
+                    ..default()
+                },
+                readback_layers.clone(),
+                ReadbackCompositeCamera,
+                Name::new("readback_composite_camera"),
+            ));
+
+            let quad_mesh = meshes.add(Mesh::from(bevy::math::primitives::Plane3d::default()));
+            let rb_scene_mat = std_materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(main_scene_target.0.clone()),
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Opaque,
+                ..default()
+            });
+            let rb_ui_mat = std_materials.add(StandardMaterial {
+                base_color: Color::WHITE,
+                base_color_texture: Some(overlay_ui_target.0.clone()),
+                unlit: true,
+                cull_mode: None,
+                alpha_mode: AlphaMode::Blend,
+                ..default()
+            });
+
+            commands.spawn((
+                Mesh3d(quad_mesh.clone()),
+                MeshMaterial3d(rb_scene_mat),
+                Transform::from_xyz(0.0, 0.0, 0.0)
+                    .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                readback_layers.clone(),
+                ReadbackCompositeSceneQuad,
+                Name::new("readback_composite_scene_quad"),
+            ));
+            commands.spawn((
+                Mesh3d(quad_mesh),
+                MeshMaterial3d(rb_ui_mat),
+                Transform::from_xyz(0.0, 0.0, 0.001)
+                    .with_rotation(Quat::from_rotation_x(std::f32::consts::FRAC_PI_2)),
+                GlobalTransform::default(),
+                Visibility::Visible,
+                readback_layers,
+                ReadbackCompositeUiQuad,
+                Name::new("readback_composite_ui_quad"),
+            ));
+        }
+    }
+
+    // Dedicated full-window overlay camera for egui controls.
+    // NOTE: bevy_egui ties input + primary-context management to a window; if the
+    // primary context is attached to a viewport-sliced 3D camera, pointer hit-testing
+    // and widget interaction can break (especially in wasm).
+    // Keep this camera targeting the window, and ensure it never clears.
+    let overlay_camera_entity = commands
+        .spawn((
+            Camera2d,
+            Camera {
+                viewport: None,
+                // Must draw after the 3D scene.
+                order: 20_000,
+                target: RenderTarget::Window(WindowRef::Primary),
+                clear_color: ClearColorConfig::None,
+                ..default()
+            },
+            OverlayUiCamera,
+            bevy_egui::PrimaryEguiContext,
+            Name::new("overlay_ui_camera"),
+        ))
+        .id();
+
+    commands.insert_resource(OverlayUiCameraMainEntity(Some(overlay_camera_entity)));
 
     commands.spawn((
         Camera3d::default(),
+        Camera {
+            viewport: None,
+            order: 0,
+            target: RenderTarget::Image(main_scene_target.0.clone().into()),
+            clear_color: ClearColorConfig::Default,
+            ..default()
+        },
         Projection::Perspective(PerspectiveProjection {
             near: 0.02,
             far: 3000.0,
@@ -7075,6 +8052,7 @@ fn sync_view_cameras(
 fn update_multiview_viewports(
     multi_view: Res<MultiView>,
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    stable: Res<StableMainRenderSize>,
     cam_ids: Query<(Entity, &ViewCamera), With<ViewCamera>>,
     mut cameras: Query<&mut Camera>,
 ) {
@@ -7082,8 +8060,13 @@ fn update_multiview_viewports(
         return;
     };
 
-    let w = window.physical_width();
-    let h = window.physical_height();
+    // If we're in explicit offscreen-present mode, compute viewports in the
+    // offscreen render target coordinate space.
+    let (w, h) = if offscreen_present_mode_enabled() && stable.width > 0 && stable.height > 0 {
+        (stable.width, stable.height)
+    } else {
+        (window.physical_width(), window.physical_height())
+    };
     if w == 0 || h == 0 {
         return;
     }
@@ -7128,9 +8111,369 @@ fn update_multiview_viewports(
     }
 }
 
+fn route_view_cameras_to_main_scene_target(
+    target: Res<MainSceneRenderTarget>,
+    mut cams: Query<&mut Camera, With<ViewCamera>>,
+) {
+    let offscreen_present = offscreen_present_mode_enabled();
+
+    for mut cam in &mut cams {
+        if offscreen_present && target.0 != Handle::default() {
+            cam.target = RenderTarget::Image(target.0.clone().into());
+        } else {
+            cam.target = RenderTarget::Window(WindowRef::Primary);
+        }
+    }
+}
+
+fn offscreen_present_mode_enabled() -> bool {
+    use std::sync::atomic::Ordering;
+
+    // NOTE: `READBACK_REQUEST_SEQ` is a monotonically increasing counter.
+    // It must NOT be used as an "in-flight" indicator, otherwise this mode
+    // would latch on forever after the first readback request.
+    let in_flight = READBACK_GPU_PHASE.load(Ordering::SeqCst) != 0
+        || READBACK_MAP_IN_FLIGHT.load(Ordering::SeqCst) != 0;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let oneshot = std::env::var("MCBAISE_READBACK_ONESHOT")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+        in_flight || oneshot
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        in_flight
+    }
+}
+
+fn readback_in_flight() -> bool {
+    use std::sync::atomic::Ordering;
+
+    let in_flight = READBACK_GPU_PHASE.load(Ordering::SeqCst) != 0
+        || READBACK_MAP_IN_FLIGHT.load(Ordering::SeqCst) != 0;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let oneshot = std::env::var("MCBAISE_READBACK_ONESHOT")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1";
+        in_flight || oneshot
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        in_flight
+    }
+}
+
+fn resize_main_scene_render_target_when_stable(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    pending_geom: Res<PendingWindowGeometry>,
+    mut stable: ResMut<StableMainRenderSize>,
+    target: Res<MainSceneRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if target.0 == Handle::default() {
+        return;
+    }
+
+    let Some(window) = windows.iter().next() else { return; };
+    let w = window.physical_width().max(1);
+    let h = window.physical_height().max(1);
+
+    // Bootstrap: ensure we have a non-zero stable size at least once, even
+    // if a resize is already pending very early in startup.
+    if stable.width == 0 || stable.height == 0 {
+        stable.width = w;
+        stable.height = h;
+    }
+
+    // For responsiveness: keep the offscreen target tracking the current window
+    // size even while a resize is pending. The swapchain may be mid-reconfigure,
+    // but the offscreen render target is safe to resize and prevents visible
+    // "stepping".
+    let _ = pending_geom;
+
+    if stable.width != w || stable.height != h {
+        stable.width = w;
+        stable.height = h;
+    }
+
+    let Some(img) = images.get_mut(&target.0) else { return; };
+    let current = img.texture_descriptor.size;
+    if current.width != w || current.height != h {
+        img.resize(Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn resize_overlay_ui_render_target_when_stable(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    pending_geom: Res<PendingWindowGeometry>,
+    target: Res<OverlayUiRenderTarget>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    if target.0 == Handle::default() {
+        return;
+    }
+
+    let Some(window) = windows.iter().next() else { return; };
+    let w = window.physical_width().max(1);
+    let h = window.physical_height().max(1);
+
+    // For responsiveness, keep the overlay target tracking the window size.
+    let _ = pending_geom;
+
+    let Some(img) = images.get_mut(&target.0) else { return; };
+    let current = img.texture_descriptor.size;
+    if current.width != w || current.height != h {
+        img.resize(Extent3d {
+            width: w,
+            height: h,
+            depth_or_array_layers: 1,
+        });
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn update_present_quads_to_window(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    present_proj: Query<&Projection, With<PresentCamera>>,
+    mut q: Query<
+        &mut Transform,
+        Or<(
+            With<PresentSceneQuad>,
+            With<PresentUiQuad>,
+            With<ReadbackCompositeSceneQuad>,
+            With<ReadbackCompositeUiQuad>,
+        )>,
+    >,
+) {
+    if !offscreen_present_mode_enabled() {
+        return;
+    }
+
+    // Prefer sizing the quads directly from the swapchain pixel size.
+    // In practice this is the most robust way to avoid the "tiny centered image
+    // with black borders" symptom on Windows high-DPI setups.
+    let Some(window) = windows.iter().next() else { return; };
+    let w_u = window.physical_width();
+    let h_u = window.physical_height();
+    // During live resize on Windows, winit can briefly report 0 sizes.
+    // Do NOT clamp to 1 here, otherwise we latch a tiny quad and present a
+    // "jacked" miniature image for a frame.
+    if w_u == 0 || h_u == 0 {
+        return;
+    }
+    let w = w_u as f32;
+    let h = h_u as f32;
+
+    // Keep a sanity check that the present camera is orthographic (expected).
+    // If this ever regresses to Perspective, the quad will look "far away".
+    if let Some(proj) = present_proj.iter().next() {
+        if !matches!(proj, Projection::Orthographic(_)) {
+            // No hard failure; just size as above.
+        }
+    }
+
+    // Quads are a known-size 1x1 `Plane3d` (local XZ). We rotate them to face
+    // the camera, so the second axis we want to scale is local Z (mapped to
+    // screen Y).
+    let scale = Vec3::new(w, 1.0, h);
+    for mut t in &mut q {
+        t.scale = scale;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn sync_present_camera_projection_to_window(
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut q: Query<&mut Projection, With<PresentCamera>>,
+) {
+    if !offscreen_present_mode_enabled() {
+        return;
+    }
+
+    let Some(window) = windows.iter().next() else { return; };
+    let w_u = window.physical_width();
+    let h_u = window.physical_height();
+    if w_u == 0 || h_u == 0 {
+        return;
+    }
+    let w = w_u as f32;
+    let h = h_u as f32;
+
+    for mut proj in &mut q {
+        let Projection::Orthographic(o) = &mut *proj else {
+            continue;
+        };
+
+        // Lock the present camera's view size to the actual swapchain pixel size.
+        // This removes DPI/logical-vs-physical ambiguity from `WindowSize`.
+        o.scaling_mode = bevy::camera::ScalingMode::Fixed { width: w, height: h };
+        // Ensure no other camera controls accidentally "zoom" the present pass.
+        // The present quad sizing assumes 1 world unit == 1 pixel.
+        o.scale = 1.0;
+        o.near = -10.0;
+        o.far = 10.0;
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn debug_present_status_system(
+    mut printed: ResMut<PresentDebugPrinted>,
+    frame: Res<GlobalFrameCount>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    main_target: Res<MainSceneRenderTarget>,
+    overlay_target: Res<OverlayUiRenderTarget>,
+    images: Res<Assets<Image>>,
+    present_cam: Query<(&Camera, Option<&Projection>), With<PresentCamera>>,
+    present_quads: Query<(&Transform, Option<&Name>), Or<(With<PresentSceneQuad>, With<PresentUiQuad>)>>,
+    view_cams: Query<(Entity, &Camera, Option<&ViewCamera>, Option<&Name>), With<ViewCamera>>,
+    all_cams: Query<(Entity, &Camera, Option<&Name>)>,
+) {
+    let enabled = std::env::var("MCBAISE_DEBUG_PRESENT")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+    if !enabled || printed.0 {
+        return;
+    }
+
+    // Wait a few frames so the initial resize-to-window systems have a chance to run.
+    if frame.0 < 10 {
+        return;
+    }
+
+    printed.0 = true;
+
+    let verbose = std::env::var("MCBAISE_DEBUG_PRESENT_VERBOSE")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+
+    let win = windows.iter().next();
+    if let Some(w) = win {
+        eprintln!(
+            "present_debug: window logical={}x{} physical={}x{} scale_factor={}",
+            w.width(),
+            w.height(),
+            w.physical_width(),
+            w.physical_height(),
+            w.scale_factor()
+        );
+    } else {
+        eprintln!("present_debug: no PrimaryWindow");
+    }
+
+    let main_size = images
+        .get(&main_target.0)
+        .map(|img| img.texture_descriptor.size)
+        .unwrap_or(Extent3d {
+            width: 0,
+            height: 0,
+            depth_or_array_layers: 0,
+        });
+    let overlay_size = images
+        .get(&overlay_target.0)
+        .map(|img| img.texture_descriptor.size)
+        .unwrap_or(Extent3d {
+            width: 0,
+            height: 0,
+            depth_or_array_layers: 0,
+        });
+
+    eprintln!(
+        "present_debug: main_target={:?} size={}x{} overlay_target={:?} size={}x{}",
+        main_target.0,
+        main_size.width,
+        main_size.height,
+        overlay_target.0,
+        overlay_size.width,
+        overlay_size.height
+    );
+
+    if verbose {
+        eprintln!("present_debug: present quads:");
+        for (t, name) in &present_quads {
+            eprintln!(
+                "present_debug: - {} pos={:?} rot={:?} scale={:?}",
+                name.map(|n| n.as_str()).unwrap_or("<unnamed>"),
+                t.translation,
+                t.rotation,
+                t.scale
+            );
+        }
+
+        eprintln!("present_debug: view cameras:");
+        for (ent, cam, vc, name) in &view_cams {
+            eprintln!(
+                "present_debug: - entity={:?} name={} idx={:?} active={} order={} target={:?} viewport={:?} clear={:?}",
+                ent,
+                name.map(|n| n.as_str()).unwrap_or("<unnamed>"),
+                vc.map(|v| v.index),
+                cam.is_active,
+                cam.order,
+                cam.target,
+                cam.viewport,
+                cam.clear_color
+            );
+        }
+    }
+
+    if let Some((cam, proj)) = present_cam.iter().next() {
+        eprintln!(
+            "present_debug: PresentCamera is_active={} order={} target={:?} clear={:?} viewport={:?}",
+            cam.is_active,
+            cam.order,
+            cam.target,
+            cam.clear_color,
+            cam.viewport
+        );
+        if let Some(p) = proj {
+            eprintln!("present_debug: PresentCamera projection={:?}", p);
+        }
+    } else {
+        eprintln!("present_debug: missing PresentCamera");
+    }
+
+    eprintln!("present_debug: window-target cameras (Primary):");
+    for (ent, cam, name) in &all_cams {
+        let RenderTarget::Window(win_ref) = &cam.target else {
+            continue;
+        };
+        if !matches!(win_ref, WindowRef::Primary) {
+            continue;
+        }
+
+        eprintln!(
+            "present_debug: - entity={:?} name={} active={} order={} clear={:?}",
+            ent,
+            name.map(|n| n.as_str()).unwrap_or("<unnamed>"),
+            cam.is_active,
+            cam.order,
+            cam.clear_color
+        );
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 fn update_overlay_ui_camera(
     windows: Query<&Window, With<bevy::window::PrimaryWindow>>,
+    overlay_target: Res<OverlayUiRenderTarget>,
     mut q: Query<&mut Camera, With<OverlayUiCamera>>,
 ) {
     let Some(window) = windows.iter().next() else {
@@ -7142,10 +8485,32 @@ fn update_overlay_ui_camera(
         return;
     }
 
+    // When taking a GPU readback with overlays enabled, temporarily retarget the egui
+    // overlay camera back to the offscreen `OverlayUiRenderTarget` so the readback
+    // pipeline can composite it (or copy its pixels) reliably.
+    //
+    // Normal (interactive) operation keeps egui window-targeted.
+    let include_overlay_in_readback = std::env::var("MCBAISE_READBACK_INCLUDE_OVERLAY")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+    let readback_in_flight = readback_in_flight();
+    let target_offscreen_for_readback = include_overlay_in_readback
+        && readback_in_flight
+        && overlay_target.0 != Handle::default();
+
     for mut cam in &mut q {
         cam.viewport = None;
-        cam.order = 10_000;
-        cam.clear_color = ClearColorConfig::None;
+        cam.order = 20_000;
+
+        if target_offscreen_for_readback {
+            cam.target = RenderTarget::Image(overlay_target.0.clone().into());
+            cam.clear_color = ClearColorConfig::Custom(Color::srgba(0.0, 0.0, 0.0, 0.0));
+        } else {
+            cam.target = RenderTarget::Window(WindowRef::Primary);
+            cam.clear_color = ClearColorConfig::None;
+        }
     }
 }
 
@@ -7157,6 +8522,9 @@ fn update_overlay_ui_camera(
 fn gate_overlay_ui_camera_system(
     teardown: Res<TeardownState>,
     pending_geom: Res<PendingWindowGeometry>,
+    auto: Res<ResizeAutomation>,
+    time: Res<Time>,
+    last_resize: Res<LastResizeEventTime>,
     mut cams: Query<&mut Camera, With<OverlayUiCamera>>,
     mut app_exit: MessageReader<bevy::app::AppExit>,
     mut window_close: MessageReader<bevy::window::WindowCloseRequested>,
@@ -7167,12 +8535,82 @@ fn gate_overlay_ui_camera_system(
         window_close.clear();
     }
 
-    let disable = exit_requested || teardown.active || pending_geom.pending;
+    // Core2D window pass is still fragile under aggressive Vulkan resizing.
+    // Disable the overlay *only while a resize is pending* (the last frame will
+    // remain visible) to avoid wgpu validation errors like "Encoder is invalid".
+    let now = time.elapsed_secs_f64();
+    let hide_secs = overlay_hide_after_resize_secs();
+    let recently_resized = last_resize
+        .last_secs
+        .is_some_and(|t| (now - t).max(0.0) < hide_secs);
+
+    // For autoresize, the window size is intentionally changing frequently.
+    // Keep overlays off during the automation run, and only re-enable them
+    // after the resize stream has been idle for a short period.
+    let disable = exit_requested || teardown.active || pending_geom.pending || auto.active || recently_resized;
     for mut cam in &mut cams {
         cam.is_active = !disable;
         if disable {
             cam.clear_color = ClearColorConfig::None;
         }
+    }
+}
+
+// The PresentCamera renders to the window surface. Some Vulkan drivers can
+// panic/validate-error if we render while the surface/swapchain is being
+// reconfigured for a resize. During pending resizes, disable the present pass;
+// Windows will typically continue displaying the last presented frame.
+#[cfg(not(target_arch = "wasm32"))]
+fn gate_present_camera_system(
+    teardown: Res<TeardownState>,
+    pending_geom: Res<PendingWindowGeometry>,
+    mut cams: Query<&mut Camera, With<PresentCamera>>,
+    mut app_exit: MessageReader<bevy::app::AppExit>,
+    mut window_close: MessageReader<bevy::window::WindowCloseRequested>,
+) {
+    let present_debug_clear = std::env::var("MCBAISE_PRESENT_DEBUG_CLEAR")
+        .as_deref()
+        .ok()
+        .unwrap_or("0")
+        == "1";
+
+    let exit_requested = !app_exit.is_empty() || !window_close.is_empty();
+    if exit_requested {
+        app_exit.clear();
+        window_close.clear();
+    }
+
+    // In normal (non-readback) runs, render directly to the window.
+    // Never auto-enable the present/composite path during interactive resizing:
+    // it prevents seeing the real 3D world and can also destabilize Vulkan.
+    if !offscreen_present_mode_enabled() {
+        for mut cam in &mut cams {
+            cam.is_active = false;
+            cam.clear_color = ClearColorConfig::None;
+        }
+        return;
+    }
+
+    // Even in offscreen-present mode, avoid rendering to the swapchain while a
+    // resize is in flight on Vulkan.
+    let disable = exit_requested || teardown.active || pending_geom.pending;
+    for mut cam in &mut cams {
+        cam.is_active = !disable;
+        if disable {
+            cam.clear_color = ClearColorConfig::None;
+            continue;
+        }
+
+        cam.target = RenderTarget::Window(WindowRef::Primary);
+        // Do not set an explicit viewport: if it becomes smaller than the actual
+        // swapchain, the result is a tiny centered image with black borders.
+        // Let Bevy use the full render target extent.
+        cam.viewport = None;
+        cam.clear_color = if present_debug_clear {
+            ClearColorConfig::Custom(Color::srgb(0.0, 0.2, 1.0))
+        } else {
+            ClearColorConfig::None
+        };
     }
 }
 
@@ -7185,7 +8623,8 @@ fn gate_main_cameras_during_geometry_system(
     pending_geom: Res<PendingWindowGeometry>,
     mut cams: Query<&mut Camera, (With<ViewCamera>, Without<OverlayUiCamera>)>,
 ) {
-    let disable = teardown.active || pending_geom.pending;
+    let _ = pending_geom;
+    let disable = teardown.active;
     for mut cam in &mut cams {
         cam.is_active = !disable;
         if disable {
@@ -7194,12 +8633,83 @@ fn gate_main_cameras_during_geometry_system(
     }
 }
 
+// Safety: prevent any non-present camera from rendering to the swapchain.
+// We render the scene and overlay into offscreen targets; the only camera that
+// should ever target the Primary window is `PresentCamera`. If any other camera
+// targets the window, it can clear/overwrite the swapchain and produce a grey/
+// black window even though the offscreen render targets are correct.
+#[cfg(not(target_arch = "wasm32"))]
+fn enforce_only_present_camera_targets_window(
+    mut cams: Query<(Option<&PresentCamera>, Option<&OverlayUiCamera>, &mut Camera)>,
+) {
+    if !offscreen_present_mode_enabled() {
+        return;
+    }
+
+    for (is_present, is_overlay, mut cam) in &mut cams {
+        if is_present.is_some() || is_overlay.is_some() {
+            continue;
+        }
+
+        // Disable any non-present camera that targets any window. This includes
+        // `WindowRef::Primary` and entity-specific window refs that can appear
+        // after extraction.
+        if matches!(cam.target, RenderTarget::Window(_)) {
+            cam.is_active = false;
+        }
+    }
+}
+
+// Mouse-driven resizing does not go through our deferred scheduler, but it still
+// reconfigures the Vulkan surface/swapchain. Track those events and mark a
+// "pending geometry" window so we can temporarily render via the stable
+// offscreen-present path during live resize.
+#[cfg(not(target_arch = "wasm32"))]
+fn track_interactive_window_resize_system(
+    frame: Res<GlobalFrameCount>,
+    mut pending_geom: ResMut<PendingWindowGeometry>,
+    time: Res<Time>,
+    mut last_resize: ResMut<LastResizeEventTime>,
+    windows: Query<(Entity, &Window), With<PrimaryWindow>>,
+    mut resized: MessageReader<bevy::window::WindowResized>,
+) {
+    let Some((primary_entity, window)) = windows.iter().next() else {
+        resized.clear();
+        return;
+    };
+
+    let mut saw_primary = false;
+    for ev in resized.read() {
+        if ev.window == primary_entity {
+            saw_primary = true;
+        }
+    }
+    if !saw_primary {
+        return;
+    }
+
+    let w = window.physical_width();
+    let h = window.physical_height();
+    if w == 0 || h == 0 {
+        return;
+    }
+
+    pending_geom.pending = true;
+    pending_geom.target_w = w;
+    pending_geom.target_h = h;
+    pending_geom.scheduled_frame = Some(frame.0);
+
+    // Extend overlay suppression while the user is actively resizing.
+    last_resize.last_secs = Some(time.elapsed_secs_f64());
+}
+
 // Watch for a UI-requested window geometry change to settle, then request a camera restart.
 fn window_geometry_watch_system(
     windows: Query<&Window, With<PrimaryWindow>>,
     mut pending_geom: ResMut<PendingWindowGeometry>,
     mut restart_req: ResMut<CameraRestartRequested>,
     mut teardown: ResMut<TeardownState>,
+    view_cams: Query<&Camera, With<ViewCamera>>,
     loading: Res<LoadingState>,
     frame: Res<GlobalFrameCount>,
 ) {
@@ -7212,9 +8722,13 @@ fn window_geometry_watch_system(
     // later, and Bevy's pipelined rendering means render-world state can lag.
     // Keep `pending` asserted for a few frames after the deferred apply frame
     // to avoid transient mismatches (e.g. depth vs color attachment size).
-    const WINDOW_GEOM_STABILIZE_FRAMES: u64 = 3;
+    // Keep this small for responsiveness; increase via env if needed.
+    let window_geom_stabilize_frames: u64 = std::env::var("MCBAISE_GEOM_STABILIZE_FRAMES")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
     if let Some(applied_frame) = pending_geom.scheduled_frame {
-        let hold_until = applied_frame.saturating_add(WINDOW_GEOM_STABILIZE_FRAMES);
+        let hold_until = applied_frame.saturating_add(window_geom_stabilize_frames);
         if frame.0 <= hold_until {
             return;
         }
@@ -7224,7 +8738,17 @@ fn window_geometry_watch_system(
     let ww = window.physical_width();
     let wh = window.physical_height();
     if ww == 0 || wh == 0 { return; }
-    if ww == pending_geom.target_w && wh == pending_geom.target_h {
+
+    // DPI scaling / platform rounding can cause the realized physical size to
+    // differ slightly from the requested target. Treat sizes within a small
+    // epsilon as settled to avoid stalling autoresize.
+    let eps: u32 = std::env::var("MCBAISE_GEOM_SETTLE_EPS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    let dw = ww.abs_diff(pending_geom.target_w);
+    let dh = wh.abs_diff(pending_geom.target_h);
+    if dw <= eps && dh <= eps {
         pending_geom.pending = false;
         pending_geom.scheduled_frame = None;
         // Only activate teardown if the app has finished initial loading and
@@ -7241,12 +8765,18 @@ fn window_geometry_watch_system(
                 teardown.frames_left = 4;
                 eprintln!("native: window geometry settled -> starting teardown countdown (forced)");
             } else {
-                // We no longer do destructive teardown for simple resizes, but we
-                // still need to ensure view cameras come back and their state is
-                // refreshed. Without this, cameras can remain inactive from the
-                // pending-resize gating frame and views appear black.
-                restart_req.requested = true;
-                eprintln!("native: window geometry settled -> resizing in-place (no teardown)");
+                // Avoid destructive teardown for simple resizes.
+                // Only request a camera restart if a view camera ended up inactive.
+                // This keeps the resize path cheap and helps avoid visible stutter.
+                let any_inactive_view = view_cams.iter().any(|c| !c.is_active);
+                if any_inactive_view {
+                    restart_req.requested = true;
+                    eprintln!(
+                        "native: window geometry settled -> resizing in-place (requesting camera restart: inactive view found)"
+                    );
+                } else {
+                    eprintln!("native: window geometry settled -> resizing in-place (no teardown)");
+                }
             }
         } else {
             eprintln!("native: window geometry settled but loading not ready; skipping teardown");
@@ -7273,6 +8803,10 @@ fn resize_automation_step(
 
     if auto.exit_requested {
         if !pending_geom.pending && !deferred.pending {
+            eprintln!(
+                "native: resize-automation reached max_steps={} -> requesting AppExit::Success",
+                auto.max_steps
+            );
             app_exit.write(AppExit::Success);
         }
         return;
@@ -7294,7 +8828,7 @@ fn resize_automation_step(
     // Only issue the next step when the previous resize has fully settled.
     // Otherwise `pending` stays asserted continuously and view cameras remain
     // gated off (black views).
-    if pending_geom.pending || deferred.pending {
+    if auto.wait_for_settle && (pending_geom.pending || deferred.pending) {
         return;
     }
 
@@ -7312,7 +8846,7 @@ fn resize_automation_step(
     const MAX_HEIGHT: u16 = 401;
     const MIN_WIDTH: u16 = 1;
     const MIN_HEIGHT: u16 = 1;
-    const RESIZE_STEP: u16 = 4;
+    let step_px: u16 = auto.step_px.max(1);
 
     let mut w = auto.width;
     let mut h = auto.height;
@@ -7322,28 +8856,30 @@ fn resize_automation_step(
             if h <= MIN_HEIGHT {
                 auto.phase = Phase::ContractingX;
             } else {
-                h = h.saturating_sub(RESIZE_STEP);
+                // Clamp so we never step below MIN_HEIGHT.
+                h = h.saturating_sub(step_px).max(MIN_HEIGHT);
             }
         }
         Phase::ContractingX => {
             if w <= MIN_WIDTH {
                 auto.phase = Phase::ExpandingY;
             } else {
-                w = w.saturating_sub(RESIZE_STEP);
+                // Clamp so we never step below MIN_WIDTH.
+                w = w.saturating_sub(step_px).max(MIN_WIDTH);
             }
         }
         Phase::ExpandingY => {
             if h >= MAX_HEIGHT {
                 auto.phase = Phase::ExpandingX;
             } else {
-                h = h.saturating_add(RESIZE_STEP);
+                h = h.saturating_add(step_px).min(MAX_HEIGHT);
             }
         }
         Phase::ExpandingX => {
             if w >= MAX_WIDTH {
                 auto.phase = Phase::ContractingY;
             } else {
-                w = w.saturating_add(RESIZE_STEP);
+                w = w.saturating_add(step_px).min(MAX_WIDTH);
             }
         }
     }
@@ -7353,20 +8889,16 @@ fn resize_automation_step(
         auto.width = w;
         auto.height = h;
 
-        // Defer the actual resize to next frame to keep the render-world surface
-        // reconfigure away from the same frame as UI layout and to give camera
-        // gating time to kick in.
-        pending_geom.pending = true;
-        pending_geom.target_w = w as u32;
-        pending_geom.target_h = h as u32;
-        // `scheduled_frame` tracks the deferred apply frame (not the schedule frame).
-        // The settle watcher will keep `pending` asserted for a few frames after.
-        pending_geom.scheduled_frame = Some(frame.0 + 1);
-
-        deferred.pending = true;
-        deferred.target_w = w as u32;
-        deferred.target_h = h as u32;
-        deferred.apply_frame = frame.0 + 1;
+        // Use the shared scheduler so we handle "streams" of requests without
+        // continually pushing the apply frame forward.
+        schedule_window_geometry_change(
+            &mut pending_geom,
+            &mut deferred,
+            w as u32,
+            h as u32,
+            frame.0,
+            "resize-automation scheduled",
+        );
 
         // Leave some frames between steps so the scene is visible.
         auto.next_step_frame = frame.0 + step_every_frames;
@@ -7377,10 +8909,10 @@ fn resize_automation_step(
         }
 
         eprintln!(
-            "native: resize-automation scheduled geometry -> {}x{} (apply_frame={}, frame={})",
+            "native: resize-automation step -> {}x{} (next_step_frame={}, frame={})",
             w,
             h,
-            deferred.apply_frame,
+            auto.next_step_frame,
             frame.0
         );
     }
@@ -7449,7 +8981,8 @@ fn restart_cameras_system(
 
     for mut cam in params.p0().iter_mut() {
         cam.is_active = true;
-        cam.order = 10_000;
+        cam.order = 20_000;
+        cam.target = RenderTarget::Window(WindowRef::Primary);
         cam.clear_color = ClearColorConfig::None;
     }
 
@@ -7497,7 +9030,8 @@ fn restart_cameras_execute_system(
                 Camera2d,
                 Camera {
                     viewport: None,
-                    order: 10_000,
+                    order: 20_000,
+                    target: RenderTarget::Window(WindowRef::Primary),
                     clear_color: ClearColorConfig::None,
                     ..default()
                 },
@@ -7715,6 +9249,9 @@ fn restart_scene_execute_system(
     mut tube_materials: ResMut<Assets<TubeMaterial>>,
     mut std_materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
+    main_scene_target: Res<MainSceneRenderTarget>,
+    overlay_ui_target: Res<OverlayUiRenderTarget>,
+    readback: Option<Res<GpuReadbackImage>>,
     assets: Option<Res<BurnHumanAssets>>,
     // queries to find and despawn existing scene entities
     tube_q: Query<Entity, With<TubeTag>>,
@@ -7753,7 +9290,16 @@ fn restart_scene_execute_system(
 
         if !(has_tube || has_subject || has_ball || has_light) {
             // Nothing present: perform the full setup.
-            setup_scene(commands, meshes, tube_materials, std_materials, images);
+            setup_scene(
+                commands,
+                meshes,
+                tube_materials,
+                std_materials,
+                images,
+                main_scene_target,
+                overlay_ui_target,
+                readback,
+            );
         } else {
             // Otherwise, keep existing entities; we may still want to update
             // materials/transforms (left to existing Update systems such as
@@ -8109,6 +9655,107 @@ fn gif_auto_capture_system(
     }
 }
 
+// Diagnostic helper: request a single GPU readback automatically at startup.
+// Enable with:
+// - MCBAISE_AUTO_READBACK=1
+// Optional:
+// - MCBAISE_AUTO_READBACK_AFTER_READY=1 (default; waits for loading stage Ready)
+// The output is written via the existing readback pipeline and will log a
+// checksum sample; it also writes a PNG if `image` feature is enabled.
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_one_shot_readback_system(
+    loading: Res<LoadingState>,
+    time: Res<Time>,
+    mut readback: ResMut<GpuReadbackImage>,
+    mut images: ResMut<Assets<Image>>,
+    mut done: Local<bool>,
+) {
+    use std::sync::atomic::Ordering;
+    if *done {
+        return;
+    }
+
+    if std::env::var("MCBAISE_AUTO_READBACK").as_deref().ok() != Some("1") {
+        return;
+    }
+
+    let wait_for_ready = std::env::var("MCBAISE_AUTO_READBACK_AFTER_READY")
+        .as_deref()
+        .ok()
+        .unwrap_or("1")
+        == "1";
+    if wait_for_ready && loading.stage != LoadingStage::Ready {
+        return;
+    }
+
+    // Ensure readback image exists immediately so the render-side system can copy from it.
+    if readback.0 == Handle::default() {
+        let mut image = Image::new_fill(
+            Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            TextureDimension::D2,
+            &[0, 0, 0, 0],
+            TextureFormat::Rgba8UnormSrgb,
+            RenderAssetUsages::MAIN_WORLD | RenderAssetUsages::RENDER_WORLD,
+        );
+        image.texture_descriptor.usage = bevy::render::render_resource::TextureUsages::RENDER_ATTACHMENT
+            | bevy::render::render_resource::TextureUsages::COPY_SRC
+            | bevy::render::render_resource::TextureUsages::TEXTURE_BINDING;
+        readback.0 = images.add(image);
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let dir = format!(".tmp/readback_auto_{}_{}", ts, (time.elapsed().as_secs_f64() * 1000.0) as u64);
+    let _ = std::fs::create_dir_all(&dir);
+    unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+    unsafe { std::env::set_var("MCBAISE_READBACK_ONESHOT", "1"); }
+
+    if READBACK_REQUEST_SEQ.load(Ordering::SeqCst) == 0
+        && READBACK_MAP_IN_FLIGHT.load(Ordering::SeqCst) == 0
+    {
+        READBACK_REQUEST_SEQ.fetch_add(1, Ordering::SeqCst);
+        eprintln!("native: auto one-shot readback requested -> {}", dir);
+        *done = true;
+    }
+}
+
+// Optional native helper: automatically exit the app after a one-shot readback
+// completes (PNG written and the readback pipeline clears MCBAISE_READBACK_ONESHOT).
+// Enable with:
+// - MCBAISE_AUTO_READBACK_EXIT=1
+#[cfg(not(target_arch = "wasm32"))]
+fn auto_exit_after_one_shot_readback_system(
+    mut seen_oneshot: Local<bool>,
+    mut app_exit: MessageWriter<AppExit>,
+) {
+    if std::env::var("MCBAISE_AUTO_READBACK_EXIT").as_deref().ok() != Some("1") {
+        return;
+    }
+
+    let oneshot_active = std::env::var("MCBAISE_READBACK_ONESHOT").as_deref().ok() == Some("1");
+    if !*seen_oneshot {
+        if oneshot_active {
+            *seen_oneshot = true;
+        }
+        return;
+    }
+
+    // Once the render-side system finishes writing and clears MCBAISE_READBACK_ONESHOT,
+    // exit cleanly.
+    if !oneshot_active {
+        eprintln!(
+            "native: one-shot readback completed -> requesting AppExit::Success (MCBAISE_AUTO_READBACK_EXIT=1)"
+        );
+        app_exit.write(AppExit::Success);
+    }
+}
+
 // --- Capture UI + preview (native only) ---------------------------------
 
 // Preview entry stores one or more frames (for GIFs) with their bevy handles and egui texture ids.
@@ -8272,6 +9919,7 @@ fn native_controls(
     }
 
     // One-shot PNG capture: press `P` to write a single frame PNG to .tmp/readback_<ts>/
+    #[cfg(not(target_arch = "wasm32"))]
     if keys.just_pressed(KeyCode::F5) {
         // Ensure readback image exists immediately so the render-side system can copy from it.
         if readback.0 == Handle::default() {
@@ -8321,10 +9969,15 @@ fn native_controls(
                 cs.order.retain(|k| !k.starts_with(&dir));
             }
     }
+    #[cfg(target_arch = "wasm32")]
+    if keys.just_pressed(KeyCode::F5) {
+        // No filesystem on wasm builds.
+    }
 
     // GIF recording toggle: press `G` to start/stop recording. Frames are written
     // to `.tmp/readback_<ts>/frame_*.png`. On stop, frames are assembled into
     // `.tmp/readback_<ts>/animation.gif` in a background thread.
+    #[cfg(not(target_arch = "wasm32"))]
     if keys.just_pressed(KeyCode::F6) {
         match std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() {
             Some("1") => {
@@ -8360,8 +10013,13 @@ fn native_controls(
             }
         }
     }
+    #[cfg(target_arch = "wasm32")]
+    if keys.just_pressed(KeyCode::F6) {
+        // No filesystem/threads on wasm builds.
+    }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn assemble_gif_from_dir(dir: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use std::fs::{read_dir, File};
     use std::path::Path;
@@ -8430,6 +10088,11 @@ fn assemble_gif_from_dir(dir: &str) -> Result<(), Box<dyn std::error::Error + Se
     std::fs::rename(&tmp_path, &out_path)?;
     eprintln!("native: wrote GIF {}", out_path.display());
     Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn assemble_gif_from_dir(_dir: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    Err("GIF assembly is not supported on wasm".into())
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -9507,6 +11170,7 @@ struct UiOverlayParams<'w, 's> {
     images_assets: ResMut<'w, Assets<Image>>,
     capture_state: ResMut<'w, EguiCaptureState>,
     pending_window_geometry: ResMut<'w, PendingWindowGeometry>,
+    deferred_window_resolution_change: ResMut<'w, DeferredWindowResolutionChange>,
     teardown: ResMut<'w, TeardownState>,
     overlay_text: Res<'w, OverlayText>,
     overlay_vis: ResMut<'w, OverlayVisibility>,
@@ -9517,6 +11181,7 @@ struct UiOverlayParams<'w, 's> {
     multi_view_hint: ResMut<'w, MultiViewHint>,
     playback: ResMut<'w, Playback>,
     time: Res<'w, Time>,
+    frame: Res<'w, GlobalFrameCount>,
     settings: ResMut<'w, TubeSettings>,
     scheme_mode: ResMut<'w, ColorSchemeMode>,
     pattern_mode: ResMut<'w, TexturePatternMode>,
@@ -9540,6 +11205,8 @@ struct UiOverlayParams<'w, 's> {
     windows: Query<'w, 's, &'static mut Window, With<PrimaryWindow>>,
     pending: ResMut<'w, GpuReadbackPending>,
     loading_state: Res<'w, LoadingState>,
+    resize_automation: Res<'w, ResizeAutomation>,
+    auto_resolution_cycle: Res<'w, AutoResolutionCycle>,
 }
 
 fn ui_overlay(
@@ -9579,9 +11246,13 @@ fn ui_overlay(
     keys,
     mut windows,
     mut pending_window_geometry,
+    mut deferred_window_resolution_change,
     mut teardown,
     pending,
     loading_state,
+    resize_automation,
+    auto_resolution_cycle,
+    frame,
      }: UiOverlayParams) {
     // Handle ESC priority
     if keys.just_pressed(KeyCode::Escape) {
@@ -9594,21 +11265,98 @@ fn ui_overlay(
         }
     }
 
-    // Minimal resolution overlay: always-visible small widget that shows
-    // the primary window physical resolution. Useful for debugging resize
-    // behavior on both native and wasm without adding interactive controls.
+    // Minimal resolution overlay: always-visible small widget that shows the
+    // primary window physical resolution. Keep it left of the top-right view
+    // pie indicator so they never overlap.
     if let Ok(ctx) = egui_contexts.ctx_mut() {
         if let Some(mut win_iter) = windows.iter_mut().next() {
             let w = win_iter.resolution.physical_width();
             let h = win_iter.resolution.physical_height();
-            egui::Window::new("resolution_overlay")
-                .title_bar(false)
-                .resizable(false)
-                .collapsible(false)
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-8.0, 8.0))
+
+            // Place the *right edge* of the resolution label to the left of the
+            // pie (pie right edge is ~10px from right; pie width ~28px).
+            egui::Area::new(egui::Id::new("resolution_overlay"))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-46.0, 10.0))
                 .show(ctx, |ui| {
-                    ui.label(format!("Resolution: {} x {}", w, h));
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
+                        .stroke(egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                        ))
+                        .corner_radius(egui::CornerRadius::same(10))
+                        .inner_margin(egui::Margin::symmetric(10, 7))
+                        .show(ui, |ui| {
+                            ui.label(format!("Resolution: {} x {}", w, h));
+                        });
                 });
+
+            // Auto-exit overlay: show *why* the app will exit and roughly when.
+            // This prevents "it exited by itself" confusion when running smoke tests.
+            let mut lines: Vec<String> = Vec::new();
+
+            if resize_automation.active && resize_automation.max_steps > 0 {
+                let remaining = resize_automation
+                    .max_steps
+                    .saturating_sub(resize_automation.steps_done);
+                let approx_frames_left = remaining
+                    .saturating_mul(resize_automation.step_every_frames.max(1) as u32);
+                lines.push(format!(
+                    "AUTOEXIT: autoresize {}/{} (remaining {} steps, ~{} frames)",
+                    resize_automation.steps_done,
+                    resize_automation.max_steps,
+                    remaining,
+                    approx_frames_left
+                ));
+                lines.push("Disable: MCBAISE_AUTORESIZE_MAX_STEPS=0".to_string());
+            }
+
+            if auto_resolution_cycle.active && auto_resolution_cycle.max_cycles > 0 {
+                let remaining = auto_resolution_cycle
+                    .max_cycles
+                    .saturating_sub(auto_resolution_cycle.cycles_done);
+                let approx_frames_left = remaining
+                    .saturating_mul(auto_resolution_cycle.every_frames.max(1) as u32);
+                lines.push(format!(
+                    "AUTOEXIT: autocycle {}/{} (remaining {} cycles, ~{} frames)",
+                    auto_resolution_cycle.cycles_done,
+                    auto_resolution_cycle.max_cycles,
+                    remaining,
+                    approx_frames_left
+                ));
+                lines.push("Disable: MCBAISE_AUTOCYCLE_MAX_CYCLES=0".to_string());
+            }
+
+            if std::env::var("MCBAISE_AUTO_READBACK_EXIT").as_deref().ok() == Some("1") {
+                lines.push("AUTOEXIT: one-shot readback will exit when complete".to_string());
+                lines.push("Disable: unset MCBAISE_AUTO_READBACK_EXIT".to_string());
+            }
+
+            if !lines.is_empty() {
+                egui::Window::new("autoexit_overlay")
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+                    .show(ctx, |ui| {
+                        for line in &lines {
+                            ui.label(line);
+                        }
+                        let loading_stage_str = match loading_state.stage {
+                            LoadingStage::LoadingAssets => "LoadingAssets",
+                            LoadingStage::WaitingForGpu => "WaitingForGpu",
+                            LoadingStage::Ready => "Ready",
+                        };
+                        ui.label(format!(
+                            "frame={} pending_geom={} deferred={} teardown={} loading={}",
+                            frame.0,
+                            pending_window_geometry.pending,
+                            deferred_window_resolution_change.pending,
+                            teardown.active,
+                            loading_stage_str
+                        ));
+                    });
+            }
         }
     }
 
@@ -9623,7 +11371,8 @@ fn ui_overlay(
         }
     }
      // Register any new PNGs with bevy assets + egui before borrowing the egui ctx
-     {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
          // Only poll the filesystem for previews when the capture UI is visible
          // or when GIF recording is active. This prevents loading user previews
          // while the capture UI feature is compiled out or hidden.
@@ -9753,6 +11502,21 @@ fn ui_overlay(
      }
 
     let Ok(ctx) = egui_contexts.ctx_mut() else {
+        // If overlays are missing/non-interactive, this is the first thing to verify.
+        // Only print when explicitly requested.
+        if std::env::var("MCBAISE_DEBUG_EGUI")
+            .as_deref()
+            .ok()
+            .unwrap_or("0")
+            == "1"
+        {
+            static PRINTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            PRINTED.get_or_init(|| {
+                eprintln!(
+                    "egui_debug: no primary egui context available (ui overlay will not render)"
+                );
+            });
+        }
         return;
     };
 
@@ -9809,42 +11573,45 @@ fn ui_overlay(
                 }
             }
 
-            let recording = std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1");
-            let mut assembling = false;
-            if let Ok(read_tmp) = std::fs::read_dir(".tmp") {
-                for ent in read_tmp.filter_map(|e| e.ok()) {
-                    let p = ent.path();
-                    if p.is_dir() && p.join("animation.gif.tmp").exists() {
-                        assembling = true;
-                        break;
-                    }
-                }
-            }
-
-            let btn_enabled = recording || !assembling;
-            let btn_label = if recording { "Stop GIF" } else { "Start GIF" };
-
-            if ui.add_enabled(btn_enabled, egui::Button::new(btn_label)).clicked() {
-                match std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() {
-                    Some("1") => {
-                        unsafe { std::env::remove_var("MCBAISE_GIF_RECORD"); }
-                        if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
-                            unsafe { std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
-                            eprintln!("native: UI stopping GIF recording, assembling {}", dir);
-                            std::thread::spawn(move || {
-                                if let Err(e) = assemble_gif_from_dir(&dir) {
-                                    eprintln!("failed to assemble gif: {}", e);
-                                }
-                            });
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let recording = std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() == Some("1");
+                let mut assembling = false;
+                if let Ok(read_tmp) = std::fs::read_dir(".tmp") {
+                    for ent in read_tmp.filter_map(|e| e.ok()) {
+                        let p = ent.path();
+                        if p.is_dir() && p.join("animation.gif.tmp").exists() {
+                            assembling = true;
+                            break;
                         }
                     }
-                    _ => {
-                        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
-                        let dir = format!(".tmp/readback_{}", ts);
-                        let _ = std::fs::create_dir_all(&dir);
-                        unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
-                        unsafe { std::env::set_var("MCBAISE_GIF_RECORD", "1"); }
-                        eprintln!("native: UI started GIF recording -> {}", dir);
+                }
+
+                let btn_enabled = recording || !assembling;
+                let btn_label = if recording { "Stop GIF" } else { "Start GIF" };
+
+                if ui.add_enabled(btn_enabled, egui::Button::new(btn_label)).clicked() {
+                    match std::env::var("MCBAISE_GIF_RECORD").as_deref().ok() {
+                        Some("1") => {
+                            unsafe { std::env::remove_var("MCBAISE_GIF_RECORD"); }
+                            if let Ok(dir) = std::env::var("MCBAISE_READBACK_OUTPUT") {
+                                unsafe { std::env::remove_var("MCBAISE_READBACK_OUTPUT"); }
+                                eprintln!("native: UI stopping GIF recording, assembling {}", dir);
+                                std::thread::spawn(move || {
+                                    if let Err(e) = assemble_gif_from_dir(&dir) {
+                                        eprintln!("failed to assemble gif: {}", e);
+                                    }
+                                });
+                            }
+                        }
+                        _ => {
+                            let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+                            let dir = format!(".tmp/readback_{}", ts);
+                            let _ = std::fs::create_dir_all(&dir);
+                            unsafe { std::env::set_var("MCBAISE_READBACK_OUTPUT", &dir); }
+                            unsafe { std::env::set_var("MCBAISE_GIF_RECORD", "1"); }
+                            eprintln!("native: UI started GIF recording -> {}", dir);
+                        }
                     }
                 }
             }
@@ -9866,9 +11633,13 @@ fn ui_overlay(
                 }
                 capture_state.loaded.clear();
                 capture_state.order.clear();
-                let _ = std::fs::remove_dir_all(".tmp");
-                let _ = std::fs::create_dir_all(".tmp");
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let _ = std::fs::remove_dir_all(".tmp");
+                    let _ = std::fs::create_dir_all(".tmp");
+                }
             }
+            #[cfg(not(target_arch = "wasm32"))]
             if ui.button("📂").on_hover_text("Open captures folder").clicked() {
                 let _ = open::that(".tmp");
             }
@@ -9958,13 +11729,18 @@ fn ui_overlay(
                         .show_ui(ui, |ui| {
                             for (i, (w, h, label)) in resolutions.iter().enumerate() {
                                 if ui.selectable_value(&mut capture_state.selected_resolution, i as i32, *label).clicked() {
-                                    if let Some(mut window) = windows.iter_mut().next() {
-                                        window.resolution.set_physical_resolution(*w, *h);
-                                        pending_window_geometry.pending = true;
-                                        pending_window_geometry.target_w = *w;
-                                        pending_window_geometry.target_h = *h;
-                                        eprintln!("native: UI requested window geometry change -> {}x{}", *w, *h);
+                                    if pending_window_geometry.pending || deferred_window_resolution_change.pending {
+                                        continue;
                                     }
+
+                                    schedule_window_geometry_change(
+                                        &mut pending_window_geometry,
+                                        &mut deferred_window_resolution_change,
+                                        *w,
+                                        *h,
+                                        frame.0,
+                                        "UI requested",
+                                    );
                                 }
                             }
                         });
@@ -10050,9 +11826,11 @@ fn ui_overlay(
                         let tex_id = entry.tex_ids.get(entry.current_idx).copied().unwrap_or(egui::TextureId::default());
                         let size = egui::vec2(ui.available_width(), 120.0);
                         let resp = ui.add(egui::Image::new((tex_id, size)).sense(egui::Sense::click()));
+                        #[cfg(not(target_arch = "wasm32"))]
                         if resp.clicked() {
                             let _ = open::that(&fname);
                         }
+                        #[cfg(not(target_arch = "wasm32"))]
                         if resp.secondary_clicked() {
                             #[cfg(windows)]
                             {
@@ -10156,7 +11934,7 @@ fn ui_overlay(
         let now_sec = time.elapsed().as_secs_f64();
         if multi_view_hint.active(now_sec) {
             egui::Area::new(egui::Id::new("mcbaise_add_view_pie_hint"))
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-46.0, 12.0))
+                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 44.0))
                 .show(ctx, |ui| {
                     egui::Frame::NONE
                         .fill(egui::Color32::WHITE)
@@ -11292,56 +13070,61 @@ fn ui_overlay(
             }
         });
 
-    // Resize button above the info button
-    egui::Area::new(egui::Id::new("mcbaise_resize_button"))
-        .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -50.0))
-        .show(ctx, |ui| {
-            let desired = egui::vec2(28.0, 28.0);
-            let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+    // Resize button above the info button (native-only: resizing the OS window is not a wasm control).
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        egui::Area::new(egui::Id::new("mcbaise_resize_button"))
+            .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-10.0, -50.0))
+            .show(ctx, |ui| {
+                let desired = egui::vec2(28.0, 28.0);
+                let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
 
-            let painter = ui.painter();
-            let center = rect.center();
-            let radius = rect.width().min(rect.height()) * 0.36;
+                let painter = ui.painter();
+                let center = rect.center();
+                let radius = rect.width().min(rect.height()) * 0.36;
 
-            // Color the icon green when automation is active.
-            let icon_color = if capture_state.resize_automation_active {
-                egui::Color32::from_rgb(120, 255, 120)
-            } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
-            };
+                // Color the icon green when automation is active.
+                let icon_color = if capture_state.resize_automation_active {
+                    egui::Color32::from_rgb(120, 255, 120)
+                } else {
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 200)
+                };
 
-            painter.circle_stroke(center, radius, egui::Stroke::new(2.2, icon_color));
+                painter.circle_stroke(center, radius, egui::Stroke::new(2.2, icon_color));
 
-            // Draw a diagonal resize glyph
-            painter.text(center, egui::Align2::CENTER_CENTER, "⤢", egui::FontId::proportional(14.0), icon_color);
-
-            if resp.hovered() {
-                painter.rect_stroke(
-                    rect,
-                    egui::CornerRadius::same(6),
-                    egui::Stroke::new(
-                        1.0,
-                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
-                    ),
-                    egui::StrokeKind::Inside,
+                // Draw a diagonal resize glyph
+                painter.text(
+                    center,
+                    egui::Align2::CENTER_CENTER,
+                    "⤢",
+                    egui::FontId::proportional(14.0),
+                    icon_color,
                 );
-            }
 
-            if resp.clicked() {
-                // Toggle automation: flip the capture_state flag that mirrors
-                // the ResizeAutomation resource. The UI state is used here for
-                // immediate feedback; the render/world automation resource will
-                // be initialized and driven on the main App.
-                capture_state.resize_automation_active = !capture_state.resize_automation_active;
-            }
+                if resp.hovered() {
+                    painter.rect_stroke(
+                        rect,
+                        egui::CornerRadius::same(6),
+                        egui::Stroke::new(
+                            1.0,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 40),
+                        ),
+                        egui::StrokeKind::Inside,
+                    );
+                }
 
-            if resp.secondary_clicked() {
-                // Request cycling preset window resolutions. This is consumed
-                // on the next main-world Update to ensure the pending geometry
-                // handshake is armed before the deferred resize is applied.
-                capture_state.cycle_resolution_requested = true;
-            }
-        });
+                if resp.clicked() {
+                    // Toggle automation: flip the capture_state flag that mirrors
+                    // the ResizeAutomation resource.
+                    capture_state.resize_automation_active = !capture_state.resize_automation_active;
+                }
+
+                if resp.secondary_clicked() {
+                    // Request cycling preset window resolutions.
+                    capture_state.cycle_resolution_requested = true;
+                }
+            });
+    }
 
     if capture_state.show_info {
         egui::CentralPanel::default()

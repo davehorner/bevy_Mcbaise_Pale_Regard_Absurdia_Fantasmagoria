@@ -509,6 +509,20 @@ tasks:
       - task: mcbaise:run:backend:human -- backend=gl
 
   # Tests
+  test:
+    desc: Run all existing test tasks
+    deps:
+      - task: mcbaise:test:unit
+      - task: mcbaise:test:workspace
+      - task: test:readback
+      - task: test:readback:overlays
+      - task: test:autocycle
+      - task: test:autoresize
+      - task: test:autoresize:stress
+        vars:
+          # Prevent the umbrella task from running forever; override as needed.
+          MCBAISE_AUTORESIZE_STRESS_MAX_STEPS: '{{default "2000" .MCBAISE_AUTORESIZE_STRESS_MAX_STEPS}}'
+
   mcbaise:test:unit:
     desc: Run unit tests for the main crate
     cmds:
@@ -568,11 +582,36 @@ tasks:
       RUST_LOG: 'wgpu=error,wgpu_core=error'
       MCBAISE_DISABLE_AUTOCYCLE: '1'
       MCBAISE_AUTORESIZE: '1'
-      MCBAISE_AUTORESIZE_START_FRAME: '30'
-      MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES: '18'
-      MCBAISE_AUTORESIZE_STEP_PX: '{{default "4" .MCBAISE_AUTORESIZE_STEP_PX}}'
+      MCBAISE_AUTORESIZE_START_FRAME: '{{default "0" .MCBAISE_AUTORESIZE_START_FRAME}}'
+      MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES: '{{default "1" .MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES}}'
+      MCBAISE_AUTORESIZE_STEP_PX: '{{default "1" .MCBAISE_AUTORESIZE_STEP_PX}}'
       MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE: '{{default "1" .MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE}}'
-      MCBAISE_AUTORESIZE_MAX_STEPS: '{{default "40" .MCBAISE_AUTORESIZE_MAX_STEPS}}'
+      MCBAISE_HIDE_OVERLAY_AFTER_RESIZE_SECS: '{{default "1" .MCBAISE_HIDE_OVERLAY_AFTER_RESIZE_SECS}}'
+      MCBAISE_AUTORESIZE_MAX_STEPS: '{{default "40000" .MCBAISE_AUTORESIZE_MAX_STEPS}}'
+    cmds:
+      - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
+
+  test:autoresize:stress:
+    desc: Stress-test autoresize (resize every frame, overlays suppressed during resize stream)
+    env:
+      WGPU_BACKEND: 'vulkan'
+      WGPU_ERROR_MODE: 'nonfatal'
+      RUST_BACKTRACE: 'full'
+      BEVY_BACKTRACE: 'full'
+      RUST_LOG: 'wgpu=error,wgpu_core=error'
+      MCBAISE_DISABLE_AUTOCYCLE: '1'
+      MCBAISE_AUTORESIZE: '1'
+      # Use dedicated STRESS_* env inputs so this task isn't affected by leftover MCBAISE_AUTORESIZE_* vars.
+      MCBAISE_AUTORESIZE_START_FRAME: '{{default "0" .MCBAISE_AUTORESIZE_STRESS_START_FRAME}}'
+      MCBAISE_AUTORESIZE_STEP_EVERY_FRAMES: '{{default "1" .MCBAISE_AUTORESIZE_STRESS_STEP_EVERY_FRAMES}}'
+      MCBAISE_AUTORESIZE_STEP_PX: '{{default "1" .MCBAISE_AUTORESIZE_STRESS_STEP_PX}}'
+      MCBAISE_AUTORESIZE_WAIT_FOR_SETTLE: '{{default "0" .MCBAISE_AUTORESIZE_STRESS_WAIT_FOR_SETTLE}}'
+      MCBAISE_HIDE_OVERLAY_AFTER_RESIZE_SECS: '{{default "2" .MCBAISE_AUTORESIZE_STRESS_HIDE_OVERLAY_AFTER_RESIZE_SECS}}'
+      # 0 = infinite (Ctrl+C). Override via MCBAISE_AUTORESIZE_STRESS_MAX_STEPS.
+      MCBAISE_AUTORESIZE_MAX_STEPS: '{{default "0" .MCBAISE_AUTORESIZE_STRESS_MAX_STEPS}}'
+      # Max throughput: skip the strong GPU-idle wait during deferred resize apply.
+      # This can surface driver/wgpu edge cases (that's the point of the stress test).
+      MCBAISE_DEFERRED_RESIZE_WAIT_FOR_IDLE: '{{default "0" .MCBAISE_AUTORESIZE_STRESS_DEFERRED_RESIZE_WAIT_FOR_IDLE}}'
     cmds:
       - cargo run --quiet --bin bevy_mcbaise_fantasmagoria_native
 
