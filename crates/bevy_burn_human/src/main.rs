@@ -75,6 +75,10 @@ pub fn main() {
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "burn_human demo".to_string(),
+                #[cfg(target_arch = "wasm32")]
+                canvas: Some("#bevy-canvas".to_string()),
+                #[cfg(target_arch = "wasm32")]
+                fit_canvas_to_parent: true,
                 ..default()
             }),
             ..default()

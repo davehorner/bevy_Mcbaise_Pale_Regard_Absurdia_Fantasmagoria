@@ -461,6 +461,78 @@ struct WasmDebugFrameOnce {
 }
 
 #[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default)]
+struct WasmScaleFactorOverrideOnce {
+    applied: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default, Clone, Copy)]
+struct WasmUrlDebugFlag {
+    enabled: bool,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_url_debug_enabled() -> bool {
+    // `index.html` already parses `?debug` and sets `window.__MCBAISE_DEBUG`.
+    // Reading that avoids needing additional `web-sys` feature flags.
+    let global = js_sys::global();
+    let v = js_sys::Reflect::get(&global, &wasm_bindgen::JsValue::from_str("__MCBAISE_DEBUG"));
+    match v {
+        Ok(val) => val.as_bool().unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_init_url_debug_flag_system(mut flag: ResMut<WasmUrlDebugFlag>) {
+    flag.enabled = wasm_url_debug_enabled();
+}
+
+// On Windows and some displays, devicePixelRatio can be fractional (e.g. 1.25).
+// During resize, different rounding paths can lead to 1px mismatches between
+// depth and color attachments (WebGPU validation error) which then invalidates
+// the recorded command buffer. To keep the render surface stable, force an
+// integer scale-factor override by default.
+//
+// Opt out with: `MCBAISE_WASM_SCALE_FACTOR_OVERRIDE=0`.
+// Override value with: `MCBAISE_WASM_SCALE_FACTOR_OVERRIDE=1` (or 2, etc).
+#[cfg(target_arch = "wasm32")]
+fn wasm_apply_scale_factor_override_once(
+    mut once: ResMut<WasmScaleFactorOverrideOnce>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if once.applied {
+        return;
+    }
+
+    let raw = std::env::var("MCBAISE_WASM_SCALE_FACTOR_OVERRIDE")
+        .ok()
+        .unwrap_or_else(|| "1".to_string());
+
+    // "0" disables this mitigation.
+    if raw.trim() == "0" {
+        once.applied = true;
+        return;
+    }
+
+    let override_sf: f32 = raw
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .unwrap_or(1.0)
+        .clamp(1.0, 4.0);
+
+    if let Ok(mut win) = windows.single_mut() {
+        // This API exists in Bevy 0.17; if it changes in the future, prefer
+        // disabling this mitigation rather than hard-failing.
+        win.resolution.set_scale_factor_override(Some(override_sf));
+    }
+
+    once.applied = true;
+}
+
+#[cfg(target_arch = "wasm32")]
 fn wasm_debug_first_update_tick(mut st: ResMut<WasmDebugFrameOnce>) {
     if st.did_log {
         return;
@@ -686,6 +758,166 @@ struct GlobalFrameCount(u64);
 #[derive(Resource, Default, Clone, Copy)]
 struct LastResizeEventTime {
     last_secs: Option<f64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+#[derive(Resource, Default, Clone, Copy)]
+struct WasmDomResizePollState {
+    // Last size we *applied* to Bevy.
+    last_css_w: u32,
+    last_css_h: u32,
+    last_apply_secs: f64,
+
+    // Last size we *observed* from the DOM (after rounding/scale).
+    last_seen_w: u32,
+    last_seen_h: u32,
+    last_seen_change_secs: f64,
+    stable_samples: u8,
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wasm_canvas_parent_css_size(canvas_selector: &str) -> Option<(f32, f32)> {
+    let win = web_sys::window()?;
+    let doc = win.document()?;
+    let canvas = doc.query_selector(canvas_selector).ok()??;
+
+    // Prefer the parent element: with `fit_canvas_to_parent` this should be the size Bevy wants.
+    let parent = canvas.parent_element()?;
+
+    // Important: `getBoundingClientRect()` can return fractional values.
+    // Winit/WebGPU surface sizing is typically based on integer CSS pixels.
+    // Using integer DOM metrics avoids 1px rounding mismatches.
+    let (w, h) = if let Ok(parent_html) = parent.clone().dyn_into::<web_sys::HtmlElement>() {
+        (parent_html.client_width() as f32, parent_html.client_height() as f32)
+    } else {
+        let rect = parent.get_bounding_client_rect();
+        (rect.width() as f32, rect.height() as f32)
+    };
+
+    if !w.is_finite() || !h.is_finite() {
+        return None;
+    }
+    // If the element is not laid out (or is mid-collapse), browsers can report
+    // 0x0 here. Resizing the WebGPU surface to a tiny size tends to trigger
+    // validation issues; keep the last stable size instead.
+    if w < 2.0 || h < 2.0 {
+        return None;
+    }
+    Some((w, h))
+}
+
+// WASM fallback: poll the DOM container size every frame and update Bevy's
+// primary window resolution when it drifts. This helps when layout changes
+// resize the canvas parent without reliably producing a browser `resize` event.
+//
+// Disable with: `MCBAISE_WASM_POLL_RESIZE=0`.
+#[cfg(target_arch = "wasm32")]
+fn wasm_poll_dom_resize_system(
+    mut state: ResMut<WasmDomResizePollState>,
+    time: Res<Time>,
+    pending_geom: Res<PendingWindowGeometry>,
+    deferred: Res<DeferredWindowResolutionChange>,
+    automation: Res<ResizeAutomation>,
+    rs: Res<RenderScale>,
+    mut windows: Query<&mut Window, With<PrimaryWindow>>,
+) {
+    if std::env::var("MCBAISE_WASM_POLL_RESIZE")
+        .as_deref()
+        .ok()
+        .unwrap_or("1")
+        == "0"
+    {
+        return;
+    }
+
+    // Don't fight the existing resize/automation machinery.
+    if pending_geom.pending || deferred.pending || automation.active {
+        return;
+    }
+
+    let Ok(mut window) = windows.single_mut() else {
+        return;
+    };
+
+    let Some((css_w, css_h)) = wasm_canvas_parent_css_size("#bevy-canvas") else {
+        return;
+    };
+
+    // Apply render scale by shrinking Bevy's logical resolution (and thus the
+    // DPR-scaled physical swapchain size) while keeping the canvas CSS size
+    // controlled by `fit_canvas_to_parent`.
+    let scale = if rs.0.is_finite() { rs.0.clamp(0.05, 2.0) } else { 1.0 };
+    let desired_w = (css_w * scale).max(1.0);
+    let desired_h = (css_h * scale).max(1.0);
+
+    // Keep stable integer CSS pixel sizing to avoid 1px/subpixel thrash.
+    let css_w_u32 = (desired_w.round() as i64).clamp(1, i64::from(u32::MAX)) as u32;
+    let css_h_u32 = (desired_h.round() as i64).clamp(1, i64::from(u32::MAX)) as u32;
+
+    // Flexbox layout (especially stacked panes / bottom “S” injection) can
+    // jitter by 1px due to rounding or browser UI overlays. If we treat those
+    // as real changes, the stability debouncer may never settle and Bevy will
+    // keep an old resolution (canvas appears not to fill).
+    let mut seen_w = css_w_u32;
+    let mut seen_h = css_h_u32;
+    if state.last_seen_w != 0 && seen_w.abs_diff(state.last_seen_w) <= 1 {
+        seen_w = state.last_seen_w;
+    }
+    if state.last_seen_h != 0 && seen_h.abs_diff(state.last_seen_h) <= 1 {
+        seen_h = state.last_seen_h;
+    }
+
+    // Rate limit updates a bit; resize storms can destabilize WebGPU.
+    let now = time.elapsed_secs_f64();
+    // Track stability: only apply after the DOM reports the *same* rounded size
+    // for a short period. This avoids resizing while CSS/layout is still
+    // animating (a common cause of depth/color attachment mismatches).
+    if seen_w != state.last_seen_w || seen_h != state.last_seen_h {
+        state.last_seen_w = seen_w;
+        state.last_seen_h = seen_h;
+        state.last_seen_change_secs = now;
+        state.stable_samples = 0;
+    } else {
+        state.stable_samples = state.stable_samples.saturating_add(1);
+    }
+
+    // Avoid repeated sets when nothing has actually changed.
+    if seen_w == state.last_css_w && seen_h == state.last_css_h {
+        return;
+    }
+
+    // Debounce: wait for stability and also cap apply frequency.
+    // Tuned to reduce WebGPU validation spam during pane injection/layout.
+    if state.stable_samples < 2 {
+        return;
+    }
+    if now - state.last_seen_change_secs < 0.15 {
+        return;
+    }
+    if now - state.last_apply_secs < 0.20 {
+        return;
+    }
+
+    // Also skip if Bevy already matches (using extracted current logical size).
+    // Bevy's logical size should align with CSS pixels on web.
+    let current_logical_w = window.resolution.width();
+    let current_logical_h = window.resolution.height();
+    if (current_logical_w - seen_w as f32).abs() < 0.5
+        && (current_logical_h - seen_h as f32).abs() < 0.5
+    {
+        state.last_css_w = seen_w;
+        state.last_css_h = seen_h;
+        state.last_apply_secs = now;
+        return;
+    }
+
+    window
+        .resolution
+        .set(seen_w as f32, seen_h as f32);
+
+    state.last_css_w = seen_w;
+    state.last_css_h = seen_h;
+    state.last_apply_secs = now;
 }
 
 fn overlay_hide_after_resize_secs() -> f64 {
@@ -4966,7 +5198,7 @@ mod render_scale_api {
 
 // Resource to expose render scale inside ECS. Systems can read this and adapt
 // rendering accordingly (e.g. adjust render targets or camera scale).
-#[derive(Resource, Debug, Clone, Copy)]
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
 #[allow(dead_code)]
 struct RenderScale(f32);
 
@@ -4978,50 +5210,13 @@ impl Default for RenderScale {
 
 #[cfg(target_arch = "wasm32")]
 fn update_render_scale_resource(mut rs: ResMut<RenderScale>) {
-    rs.0 = render_scale_api::current_render_scale();
+    let v = render_scale_api::current_render_scale();
+    let v = if v.is_finite() { v.clamp(0.05, 2.0) } else { 1.0 };
+    rs.set_if_neq(RenderScale(v));
 }
 
-// Apply the requested render scale by adjusting the primary window's render
-// resolution on wasm. This avoids touching the DOM canvas directly; instead
-// Bevy will render at the smaller resolution and the browser will upscale it.
-#[cfg(target_arch = "wasm32")]
-fn apply_render_scale_to_window(
-    mut query: Query<&mut Window, With<PrimaryWindow>>,
-    rs: Res<RenderScale>,
-) {
-    // Local imports required only on wasm target
-    use wasm_bindgen::JsCast;
-    use web_sys::HtmlElement;
-
-    if !rs.is_changed() {
-        return;
-    }
-    // Query the primary window via Bevy's ECS query interface.
-    if let Ok(mut primary) = query.single_mut() {
-        // Query the canvas client size via web-sys.
-        if let Some(win) = web_sys::window() {
-            if let Some(doc) = win.document() {
-                if let Some(el) = doc.get_element_by_id("bevy-canvas") {
-                    // Cast to HtmlElement so we can query clientWidth/clientHeight
-                    if let Ok(html) = el.dyn_into::<HtmlElement>() {
-                        let clw = html.client_width() as f32;
-                        let clh = html.client_height() as f32;
-                        // devicePixelRatio gives the CSS->device pixel ratio
-                        let ratio = win.device_pixel_ratio() as f32;
-                        let target_w = (clw * rs.0 * ratio).max(1.0);
-                        let target_h = (clh * rs.0 * ratio).max(1.0);
-                        // Use Bevy 0.17 WindowResolution API to request the physical
-                        // resolution we want the renderer to target. `set_physical_resolution`
-                        // takes integer physical pixel dimensions.
-                        primary
-                            .resolution
-                            .set_physical_resolution(target_w as u32, target_h as u32);
-                    }
-                }
-            }
-        }
-    }
-}
+// Render scale is applied on wasm via `wasm_poll_dom_resize_system` by scaling
+// the measured CSS container size before updating Bevy's logical window size.
 
 #[cfg(target_arch = "wasm32")]
 #[wasm_bindgen]
@@ -5514,6 +5709,12 @@ pub fn main() {
     app.init_resource::<GpuReadbackPending>();
     app.init_resource::<PendingWindowGeometry>();
     app.init_resource::<LastResizeEventTime>();
+    #[cfg(target_arch = "wasm32")]
+    app.init_resource::<WasmDomResizePollState>();
+    #[cfg(target_arch = "wasm32")]
+    app.init_resource::<WasmScaleFactorOverrideOnce>();
+    #[cfg(target_arch = "wasm32")]
+    app.init_resource::<WasmUrlDebugFlag>();
     app.init_resource::<MainSceneRenderTarget>();
     app.init_resource::<OverlayUiRenderTarget>();
     app.init_resource::<PresentDummyRenderTarget>();
@@ -5534,6 +5735,8 @@ pub fn main() {
     app.add_systems(Startup, ensure_main_scene_render_target_exists.before(setup_scene));
     app.add_systems(Startup, ensure_overlay_ui_render_target_exists.before(setup_scene));
     app.add_systems(Startup, ensure_present_dummy_render_target_exists.before(setup_scene));
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(Startup, wasm_init_url_debug_flag_system);
 
     // Optional automation: drive the resize stepper (the same behavior as the UI
     // resize icon) without user interaction.
@@ -5596,6 +5799,19 @@ pub fn main() {
     // - arm capture camera when a request arrives
     // - disable capture camera after a few frames
     app.add_systems(Update, loading_watch_system);
+
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        wasm_poll_dom_resize_system
+            .after(main_frame_tick_system)
+            .before(sync_view_cameras),
+    );
+    #[cfg(target_arch = "wasm32")]
+    app.add_systems(
+        Update,
+        wasm_apply_scale_factor_override_once.before(wasm_poll_dom_resize_system),
+    );
     // Ordering matters for resize automation:
     // - Apply deferred resize first.
     // - Run the automation step before the settle watcher so the watcher can
@@ -6815,11 +7031,6 @@ pub fn main() {
 
     #[cfg(target_arch = "wasm32")]
     app.add_systems(Update, update_render_scale_resource);
-    #[cfg(target_arch = "wasm32")]
-    app.add_systems(
-        Update,
-        apply_render_scale_to_window.after(update_render_scale_resource),
-    );
 
     #[cfg(not(target_arch = "wasm32"))]
     app.add_systems(Update, (advance_time_native, native_controls, gif_auto_capture_system));
@@ -8072,6 +8283,21 @@ fn update_multiview_viewports(
     }
 
     let count = (multi_view.count.clamp(1, MultiView::MAX_VIEWS)) as u32;
+
+    // When only one view is active, avoid setting an explicit viewport.
+    // During dynamic resize on wasm/WebGPU, extracted viewport size can lag the
+    // surface size by a frame, producing depth/color attachment mismatches.
+    if count == 1 {
+        for (entity, _vc) in cam_ids.iter() {
+            if let Ok(mut cam) = cameras.get_mut(entity) {
+                cam.viewport = None;
+                cam.order = 0;
+                cam.clear_color = ClearColorConfig::Default;
+            }
+        }
+        return;
+    }
+
     let base_h = (h / count).max(1);
 
     let mut ordered: Vec<(u8, Entity)> = cam_ids.iter().map(|(e, vc)| (vc.index, e)).collect();
@@ -11177,6 +11403,8 @@ struct UiOverlayParams<'w, 's> {
     caption_vis: ResMut<'w, CaptionVisibility>,
     #[cfg(target_arch = "wasm32")]
     video_vis: ResMut<'w, VideoVisibility>,
+    #[cfg(target_arch = "wasm32")]
+    wasm_debug: Res<'w, WasmUrlDebugFlag>,
     multi_view: ResMut<'w, MultiView>,
     multi_view_hint: ResMut<'w, MultiViewHint>,
     playback: ResMut<'w, Playback>,
@@ -11218,6 +11446,8 @@ fn ui_overlay(
         mut caption_vis,
         #[cfg(target_arch = "wasm32")]
         mut video_vis,
+        #[cfg(target_arch = "wasm32")]
+        wasm_debug,
         mut multi_view,
         mut multi_view_hint,
         mut playback,
@@ -11265,31 +11495,42 @@ fn ui_overlay(
         }
     }
 
-    // Minimal resolution overlay: always-visible small widget that shows the
-    // primary window physical resolution. Keep it left of the top-right view
-    // pie indicator so they never overlap.
+    // Minimal resolution overlay: show only in debug mode.
+    // Keep it left of the top-right view pie indicator so they never overlap.
     if let Ok(ctx) = egui_contexts.ctx_mut() {
         if let Some(mut win_iter) = windows.iter_mut().next() {
             let w = win_iter.resolution.physical_width();
             let h = win_iter.resolution.physical_height();
 
-            // Place the *right edge* of the resolution label to the left of the
-            // pie (pie right edge is ~10px from right; pie width ~28px).
-            egui::Area::new(egui::Id::new("resolution_overlay"))
-                .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-46.0, 10.0))
-                .show(ctx, |ui| {
-                    egui::Frame::NONE
-                        .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
-                        .stroke(egui::Stroke::new(
-                            1.0,
-                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
-                        ))
-                        .corner_radius(egui::CornerRadius::same(10))
-                        .inner_margin(egui::Margin::symmetric(10, 7))
-                        .show(ui, |ui| {
-                            ui.label(format!("Resolution: {} x {}", w, h));
-                        });
-                });
+            #[cfg(target_arch = "wasm32")]
+            let show_resolution_overlay = wasm_debug.enabled;
+            #[cfg(not(target_arch = "wasm32"))]
+            let show_resolution_overlay = std::env::var("MCBAISE_DEBUG_EGUI")
+                .as_deref()
+                .ok()
+                .unwrap_or("0")
+                == "1";
+
+            if show_resolution_overlay {
+                // Place the *right edge* of the resolution label to the left of the
+                // pie (pie right edge is ~10px from right; pie width ~28px).
+                egui::Area::new(egui::Id::new("resolution_overlay"))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-46.0, 10.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::NONE
+                            .fill(egui::Color32::from_rgba_unmultiplied(0, 0, 0, 155))
+                            .stroke(egui::Stroke::new(
+                                1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 24),
+                            ))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(10, 7))
+                            .show(ui, |ui| {
+                                // Requested format: WxH, no label.
+                                ui.label(format!("{}x{}", w, h));
+                            });
+                    });
+            }
 
             // Auto-exit overlay: show *why* the app will exit and roughly when.
             // This prevents "it exited by itself" confusion when running smoke tests.

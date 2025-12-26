@@ -14,9 +14,10 @@ fn workspace_root(manifest_dir: &Path) -> PathBuf {
 }
 
 fn main() -> io::Result<()> {
-    // Only generate embedded compressed assets for wasm builds.
+    // Only generate embedded compressed assets for wasm builds with the burn_human feature.
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
-    if target_arch != "wasm32" {
+    let burn_human = env::var("CARGO_FEATURE_BURN_HUMAN").is_ok();
+    if target_arch != "wasm32" || !burn_human {
         return Ok(());
     }
 
